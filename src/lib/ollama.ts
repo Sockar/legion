@@ -57,6 +57,18 @@ export interface ToolApprovalRequest {
   } | null;
 }
 
+export interface CommandOutputEvent {
+  request_id: string;
+  command_id: string;
+  command: string;
+  phase: "started" | "output" | "completed";
+  stream: "stdout" | "stderr" | null;
+  chunk: string | null;
+  status: "running" | "succeeded" | "failed" | "timed_out" | null;
+  exit_code: number | null;
+  error: string | null;
+}
+
 export interface ServerStatus {
   connected: boolean;
   endpoint: string;
@@ -110,6 +122,7 @@ export async function streamOllamaChat(
   workspacePath: string,
   onChunk: (chunk: ChatChunk) => void,
   onApproval: (approval: ToolApprovalRequest) => void,
+  onCommandOutput: (event: CommandOutputEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
   const requestId = crypto.randomUUID();
@@ -120,6 +133,7 @@ export async function streamOllamaChat(
     },
   );
   let unlistenApproval = () => {};
+  let unlistenCommandOutput = () => {};
   let onAbort: (() => void) | undefined;
 
   try {
@@ -127,6 +141,12 @@ export async function streamOllamaChat(
       "tools://approval-request",
       ({ payload }) => {
         if (payload.request_id === requestId) onApproval(payload);
+      },
+    );
+    unlistenCommandOutput = await listen<CommandOutputEvent>(
+      "tools://command-output",
+      ({ payload }) => {
+        if (payload.request_id === requestId) onCommandOutput(payload);
       },
     );
     if (signal?.aborted) throw new DOMException("Chat cancelled", "AbortError");
@@ -154,6 +174,7 @@ export async function streamOllamaChat(
     if (onAbort) signal?.removeEventListener("abort", onAbort);
     unlisten();
     unlistenApproval();
+    unlistenCommandOutput();
   }
 }
 

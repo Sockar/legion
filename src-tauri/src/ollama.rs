@@ -14,7 +14,8 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::{
-    RiskLevel, Tool, ToolCall, ToolContext, ToolDefinition, ToolRegistry, ToolSchema,
+    CommandOutputCallback, RiskLevel, Tool, ToolCall, ToolContext, ToolDefinition, ToolRegistry,
+    ToolSchema, COMMAND_OUTPUT_EVENT,
 };
 
 const DEFAULT_OLLAMA_ENDPOINT: &str = "http://localhost:11434";
@@ -393,8 +394,7 @@ async fn run_tool_loop(
     mut request: ChatRequest,
     request_id: &str,
     cancellation: CancellationToken,
-    approval_handler: &dyn ApprovalHandler,
-    on_chunk: &ChatCallback,
+    callbacks: ToolLoopCallbacks<'_>,
 ) -> Result<(), String> {
     let workspace = match &request.workspace_path {
         Some(workspace) => workspace.clone(),
@@ -411,7 +411,7 @@ async fn run_tool_loop(
                 tools.definitions(),
                 cancellation.clone(),
                 request_id.to_owned(),
-                on_chunk.clone(),
+                callbacks.on_chunk.clone(),
             )
             .await?;
         if cancellation.is_cancelled() {
@@ -421,7 +421,7 @@ async fn run_tool_loop(
         let tool_calls = message.tool_calls.clone().unwrap_or_default();
         request.messages.push(message.clone());
         if tool_calls.is_empty() {
-            on_chunk(ChatChunk {
+            (callbacks.on_chunk)(ChatChunk {
                 request_id: request_id.to_owned(),
                 content: String::new(),
                 done: true,
@@ -430,7 +430,7 @@ async fn run_tool_loop(
         }
 
         if iteration == MAX_TOOL_ITERATIONS {
-            on_chunk(ChatChunk {
+            (callbacks.on_chunk)(ChatChunk {
                 request_id: request_id.to_owned(),
                 content: format!("Stopped at the tool iteration limit of {MAX_TOOL_ITERATIONS}."),
                 done: true,
@@ -446,6 +446,9 @@ async fn run_tool_loop(
                 let schema = tool.schema();
                 let context = ToolContext {
                     workspace: workspace.clone(),
+                    request_id: request_id.to_owned(),
+                    command_id: format!("{request_id}-{iteration}-{call_index}"),
+                    command_output: Some(callbacks.command_output.clone()),
                 };
                 let preview = if schema.risk_level == RiskLevel::RequiresConfirmation {
                     match tokio::select! {
@@ -471,7 +474,8 @@ async fn run_tool_loop(
                     None
                 };
                 let approved = if schema.risk_level == RiskLevel::RequiresConfirmation {
-                    approval_handler
+                    callbacks
+                        .approval_handler
                         .approve(
                             ToolApprovalRequest {
                                 request_id: request_id.to_owned(),
@@ -500,7 +504,7 @@ async fn run_tool_loop(
                         _ = cancellation.cancelled() => return Ok(()),
                         result = tool.call(
                             approved_arguments,
-                            context,
+                            context.clone(),
                         ) => {
                             result.unwrap_or_else(|error| json!({ "error": error }))
                         }
@@ -522,6 +526,12 @@ async fn run_tool_loop(
     }
 
     unreachable!("tool loop returns on the final allowed iteration")
+}
+
+struct ToolLoopCallbacks<'a> {
+    approval_handler: &'a dyn ApprovalHandler,
+    command_output: CommandOutputCallback,
+    on_chunk: &'a ChatCallback,
 }
 
 #[tauri::command]
@@ -584,14 +594,23 @@ pub async fn ollama_chat(
         app: app.clone(),
         pending: backend.pending_approvals.clone(),
     };
+    let output_app = app.clone();
+    let command_output: CommandOutputCallback = Arc::new(move |event| {
+        output_app
+            .emit(COMMAND_OUTPUT_EVENT, event)
+            .map_err(|error| format!("Could not emit command output: {error}"))
+    });
     let result = run_tool_loop(
         backend.backend.as_ref(),
         &backend.tools,
         request,
         &request_id,
         cancellation,
-        &approval_handler,
-        &on_chunk,
+        ToolLoopCallbacks {
+            approval_handler: &approval_handler,
+            command_output,
+            on_chunk: &on_chunk,
+        },
     )
     .await;
     backend
@@ -726,11 +745,11 @@ mod tests {
     use super::{
         parse_ndjson_line, run_tool_loop, ApprovalHandler, ChatApiResponse, ChatCallback,
         ChatChunk, ChatMessage, ChatRequest, LlmBackend, ModelInfo, NdjsonBuffer, ServerStatus,
-        ToolApprovalRequest, MAX_TOOL_ITERATIONS,
+        ToolApprovalRequest, ToolLoopCallbacks, MAX_TOOL_ITERATIONS,
     };
     use crate::tools::{
-        RiskLevel, Tool, ToolCall, ToolContext, ToolDefinition, ToolFunctionCall, ToolRegistry,
-        ToolSchema,
+        CommandOutputCallback, RiskLevel, Tool, ToolCall, ToolContext, ToolDefinition,
+        ToolFunctionCall, ToolRegistry, ToolSchema,
     };
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -897,6 +916,10 @@ mod tests {
         )
     }
 
+    fn command_output_callback() -> CommandOutputCallback {
+        Arc::new(|_| Ok(()))
+    }
+
     #[tokio::test]
     async fn reports_tool_failures_to_model_and_reaches_final_answer() {
         let backend = MockBackend::new(vec![tool_call_response(), final_response()]);
@@ -917,8 +940,11 @@ mod tests {
             chat_request(),
             "request",
             CancellationToken::new(),
-            &approval,
-            &on_chunk,
+            ToolLoopCallbacks {
+                approval_handler: &approval,
+                command_output: command_output_callback(),
+                on_chunk: &on_chunk,
+            },
         )
         .await
         .expect("tool error is handled");
@@ -970,8 +996,11 @@ mod tests {
             chat_request(),
             "request",
             CancellationToken::new(),
-            &approval,
-            &on_chunk,
+            ToolLoopCallbacks {
+                approval_handler: &approval,
+                command_output: command_output_callback(),
+                on_chunk: &on_chunk,
+            },
         )
         .await
         .expect("denial is reported to model");
@@ -1010,8 +1039,11 @@ mod tests {
             chat_request(),
             "request",
             CancellationToken::new(),
-            &approval,
-            &on_chunk,
+            ToolLoopCallbacks {
+                approval_handler: &approval,
+                command_output: command_output_callback(),
+                on_chunk: &on_chunk,
+            },
         )
         .await
         .expect("iteration limit is a user-facing stop");

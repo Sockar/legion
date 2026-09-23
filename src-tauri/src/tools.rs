@@ -10,10 +10,40 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::{
+    io::AsyncReadExt,
+    process::Command,
+    time::{timeout, Duration},
+};
 
-#[derive(Clone, Debug)]
+const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 60_000;
+const MAX_COMMAND_TIMEOUT_MS: u64 = 600_000;
+const MAX_CAPTURED_OUTPUT_BYTES: usize = 64 * 1024;
+pub const COMMAND_OUTPUT_EVENT: &str = "tools://command-output";
+
+pub type CommandOutputCallback =
+    Arc<dyn Fn(CommandOutputEvent) -> Result<(), String> + Send + Sync>;
+type ProcessOutputCallback = dyn Fn(&str, &str) -> Result<(), String> + Send + Sync;
+
+#[derive(Clone)]
 pub struct ToolContext {
     pub workspace: PathBuf,
+    pub request_id: String,
+    pub command_id: String,
+    pub command_output: Option<CommandOutputCallback>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CommandOutputEvent {
+    pub request_id: String,
+    pub command_id: String,
+    pub command: String,
+    pub phase: String,
+    pub stream: Option<String>,
+    pub chunk: Option<String>,
+    pub status: Option<String>,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -107,6 +137,9 @@ impl ToolRegistry {
         registry
             .register(Arc::new(EditFile))
             .expect("the built-in file editing tool has a valid name");
+        registry
+            .register(Arc::new(RunCommand))
+            .expect("the built-in command tool has a valid name");
         registry
     }
 
@@ -476,20 +509,358 @@ fn edit_file_change(
     Ok((relative_path, before, after))
 }
 
+struct RunCommand;
+
+#[derive(Debug, PartialEq, Eq)]
+struct CommandResult {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+}
+
+#[async_trait]
+impl Tool for RunCommand {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "run_command".to_owned(),
+            description: "Run a shell command in the active workspace directory. Commands are not sandboxed; broader sandboxing is tracked separately in issue #12.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The exact shell command to execute."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Optional timeout in milliseconds (default 60000, maximum 600000)."
+                    }
+                },
+                "required": ["command"]
+            }),
+            risk_level: RiskLevel::RequiresConfirmation,
+        }
+    }
+
+    async fn call(&self, arguments: Value, context: ToolContext) -> Result<Value, String> {
+        let command = arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .filter(|command| !command.trim().is_empty())
+            .ok_or_else(|| "A non-empty command is required".to_owned())?
+            .to_owned();
+        let timeout_ms = arguments
+            .get("timeout_ms")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .filter(|timeout| (1..=MAX_COMMAND_TIMEOUT_MS).contains(timeout))
+                    .ok_or_else(|| {
+                        format!("timeout_ms must be between 1 and {MAX_COMMAND_TIMEOUT_MS}")
+                    })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS);
+
+        let workspace = context
+            .workspace
+            .canonicalize()
+            .map_err(|error| format!("Could not access workspace directory: {error}"))?;
+        if !workspace.is_dir() {
+            return Err("Workspace path is not a directory".to_owned());
+        }
+
+        emit_command_event(
+            &context,
+            CommandOutputEvent {
+                request_id: context.request_id.clone(),
+                command_id: context.command_id.clone(),
+                command: command.clone(),
+                phase: "started".to_owned(),
+                stream: None,
+                chunk: None,
+                status: Some("running".to_owned()),
+                exit_code: None,
+                error: None,
+            },
+        )?;
+
+        let output_context = context.clone();
+        let output_command = command.clone();
+        let result = run_command(
+            &command,
+            &workspace,
+            Duration::from_millis(timeout_ms),
+            Arc::new(move |stream, chunk| {
+                emit_command_event(
+                    &output_context,
+                    CommandOutputEvent {
+                        request_id: output_context.request_id.clone(),
+                        command_id: output_context.command_id.clone(),
+                        command: output_command.clone(),
+                        phase: "output".to_owned(),
+                        stream: Some(stream.to_owned()),
+                        chunk: Some(chunk.to_owned()),
+                        status: None,
+                        exit_code: None,
+                        error: None,
+                    },
+                )
+            }),
+        )
+        .await;
+
+        match result {
+            Ok(result) => {
+                let status = if result.exit_code == 0 {
+                    "succeeded"
+                } else {
+                    "failed"
+                };
+                emit_command_event(
+                    &context,
+                    CommandOutputEvent {
+                        request_id: context.request_id.clone(),
+                        command_id: context.command_id.clone(),
+                        command: command.clone(),
+                        phase: "completed".to_owned(),
+                        stream: None,
+                        chunk: None,
+                        status: Some(status.to_owned()),
+                        exit_code: Some(result.exit_code),
+                        error: None,
+                    },
+                )?;
+                Ok(json!({
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "exit_code": result.exit_code
+                }))
+            }
+            Err(error) => {
+                let timed_out = error.starts_with("Command timed out");
+                let status = if timed_out { "timed_out" } else { "failed" };
+                emit_command_event(
+                    &context,
+                    CommandOutputEvent {
+                        request_id: context.request_id.clone(),
+                        command_id: context.command_id.clone(),
+                        command,
+                        phase: "completed".to_owned(),
+                        stream: None,
+                        chunk: None,
+                        status: Some(status.to_owned()),
+                        exit_code: None,
+                        error: Some(error.clone()),
+                    },
+                )?;
+                Err(error)
+            }
+        }
+    }
+}
+
+fn emit_command_event(context: &ToolContext, event: CommandOutputEvent) -> Result<(), String> {
+    if let Some(callback) = &context.command_output {
+        callback(event)?;
+    }
+    Ok(())
+}
+
+async fn run_command(
+    command: &str,
+    workspace: &Path,
+    timeout_duration: Duration,
+    on_output: Arc<ProcessOutputCallback>,
+) -> Result<CommandResult, String> {
+    let mut child = shell_command(command, workspace);
+    child.kill_on_drop(true);
+    let mut child = child
+        .spawn()
+        .map_err(|error| format!("Could not start command: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Could not capture command stdout".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Could not capture command stderr".to_owned())?;
+    let stdout_task = tokio::spawn(read_output(stdout, "stdout", on_output.clone()));
+    let stderr_task = tokio::spawn(read_output(stderr, "stderr", on_output));
+
+    let wait_result = timeout(timeout_duration, child.wait()).await;
+    let timed_out = wait_result.is_err();
+    if timed_out {
+        terminate_process_tree(&mut child).await.map_err(|error| {
+            format!(
+                "Command timed out after {} ms; {error}",
+                timeout_duration.as_millis()
+            )
+        })?;
+    }
+    let status = match wait_result {
+        Ok(result) => result.map_err(|error| format!("Could not wait for command: {error}"))?,
+        Err(_) => child
+            .wait()
+            .await
+            .map_err(|error| format!("Could not wait for timed-out command: {error}"))?,
+    };
+
+    let stdout = stdout_task
+        .await
+        .map_err(|error| format!("Could not collect command stdout: {error}"))??;
+    let stderr = stderr_task
+        .await
+        .map_err(|error| format!("Could not collect command stderr: {error}"))??;
+    if timed_out {
+        return Err(format!(
+            "Command timed out after {} ms and was terminated",
+            timeout_duration.as_millis()
+        ));
+    }
+    if !status.success() && status.code().is_none() {
+        return Err("Command was terminated without an exit code".to_owned());
+    }
+
+    Ok(CommandResult {
+        stdout: captured_output_text(stdout),
+        stderr: captured_output_text(stderr),
+        exit_code: status.code().unwrap_or(-1),
+    })
+}
+
+#[cfg(windows)]
+fn shell_command(command: &str, workspace: &Path) -> Command {
+    let mut process = Command::new("cmd.exe");
+    process.arg("/C").arg(command);
+    process
+        .current_dir(workspace)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    process
+}
+
+#[cfg(not(windows))]
+fn shell_command(command: &str, workspace: &Path) -> Command {
+    let mut process = Command::new("sh");
+    process.arg("-c").arg(command);
+    process.process_group(0);
+    process
+        .current_dir(workspace)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    process
+}
+
+#[cfg(windows)]
+async fn terminate_process_tree(child: &mut tokio::process::Child) -> Result<(), String> {
+    let process_id = child
+        .id()
+        .ok_or_else(|| "Timed-out command no longer has a process ID".to_owned())?;
+    let status = Command::new("taskkill")
+        .args(["/PID", &process_id.to_string(), "/T", "/F"])
+        .status()
+        .await
+        .map_err(|error| format!("Could not terminate timed-out command tree: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not terminate timed-out command tree (taskkill exited with {status})"
+        ))
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_process_tree(child: &mut tokio::process::Child) -> Result<(), String> {
+    let process_id = child
+        .id()
+        .ok_or_else(|| "Timed-out command no longer has a process ID".to_owned())?;
+    let status = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{process_id}")])
+        .status()
+        .await
+        .map_err(|error| format!("Could not terminate timed-out command tree: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not terminate timed-out command tree (kill exited with {status})"
+        ))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn terminate_process_tree(child: &mut tokio::process::Child) -> Result<(), String> {
+    child
+        .kill()
+        .await
+        .map_err(|error| format!("Could not terminate timed-out command: {error}"))
+}
+
+async fn read_output<R>(
+    mut reader: R,
+    stream: &'static str,
+    on_output: Arc<ProcessOutputCallback>,
+) -> Result<Vec<u8>, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut captured = Vec::new();
+    let mut truncated = false;
+    let mut callback_error = None;
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|error| format!("Could not read command {stream}: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        if callback_error.is_none() {
+            if let Err(error) = on_output(stream, &String::from_utf8_lossy(&buffer[..read])) {
+                callback_error = Some(error);
+            }
+        }
+        append_limited(&mut captured, &mut truncated, &buffer[..read]);
+    }
+    if let Some(error) = callback_error {
+        return Err(error);
+    }
+    if truncated {
+        captured.extend_from_slice(b"\n...[output truncated]");
+    }
+    Ok(captured)
+}
+
+fn append_limited(output: &mut Vec<u8>, truncated: &mut bool, chunk: &[u8]) {
+    let available = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(output.len());
+    let captured = available.min(chunk.len());
+    output.extend_from_slice(&chunk[..captured]);
+    *truncated |= captured < chunk.len();
+}
+
+fn captured_output_text(output: Vec<u8>) -> String {
+    String::from_utf8_lossy(&output).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        edit_file_change, resolve_workspace_path, RiskLevel, Tool, ToolContext, ToolRegistry,
-        ToolSchema,
+        append_limited, edit_file_change, read_output, resolve_workspace_path, run_command,
+        RiskLevel, Tool, ToolContext, ToolRegistry, ToolSchema, MAX_CAPTURED_OUTPUT_BYTES,
     };
     use async_trait::async_trait;
     use serde_json::{json, Value};
     use std::sync::Arc;
     use std::{
         fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        path::{Path, PathBuf},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
+    use tokio::{io::AsyncWriteExt, time::timeout};
 
     struct TestTool(&'static str);
 
@@ -514,7 +885,12 @@ mod tests {
         let mut registry = ToolRegistry::with_examples();
         assert!(registry.register(Arc::new(TestTool("custom"))).is_ok());
         assert!(registry.register(Arc::new(TestTool("custom"))).is_err());
-        assert_eq!(registry.schemas().len(), 6);
+        assert_eq!(registry.schemas().len(), 7);
+        let command = registry.get("run_command").expect("command tool registered");
+        assert_eq!(
+            command.schema().risk_level,
+            RiskLevel::RequiresConfirmation
+        );
     }
 
     fn temporary_workspace() -> PathBuf {
@@ -585,5 +961,85 @@ mod tests {
         );
         assert!(overlapping.unwrap_err().contains("multiple times"));
         fs::remove_dir_all(workspace).expect("temporary workspace is removed");
+    }
+
+    #[test]
+    fn truncates_captured_output_at_the_limit() {
+        let mut output = Vec::new();
+        let mut truncated = false;
+        append_limited(
+            &mut output,
+            &mut truncated,
+            &vec![b'x'; MAX_CAPTURED_OUTPUT_BYTES + 10],
+        );
+        assert_eq!(output.len(), MAX_CAPTURED_OUTPUT_BYTES);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn captures_and_truncates_streamed_output() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let reader_task = tokio::spawn(read_output(
+            reader,
+            "stdout",
+            Arc::new(|_: &str, _: &str| Ok(())),
+        ));
+        let input = vec![b'x'; MAX_CAPTURED_OUTPUT_BYTES + 10];
+        writer.write_all(&input).await.expect("write test output");
+        drop(writer);
+
+        let output = reader_task
+            .await
+            .expect("reader task completes")
+            .expect("output is captured");
+        assert!(output.starts_with(&vec![b'x'; MAX_CAPTURED_OUTPUT_BYTES]));
+        assert!(output.ends_with(b"\n...[output truncated]"));
+    }
+
+    #[tokio::test]
+    async fn captures_stdout_stderr_and_exit_code() {
+        let workspace = std::env::current_dir().expect("workspace exists");
+        let command = if cfg!(windows) {
+            "echo stdout & echo stderr 1>&2 & exit /b 7"
+        } else {
+            "printf stdout; printf stderr >&2; exit 7"
+        };
+        let result = run_command(
+            command,
+            &workspace,
+            Duration::from_secs(5),
+            Arc::new(|_: &str, _: &str| Ok(())),
+        )
+        .await
+        .expect("command completes");
+        assert!(result.stdout.contains("stdout"));
+        assert!(result.stderr.contains("stderr"));
+        assert_eq!(result.exit_code, 7);
+    }
+
+    #[tokio::test]
+    async fn terminates_a_command_when_its_timeout_expires() {
+        let workspace = std::env::current_dir().expect("workspace exists");
+        let command = if cfg!(windows) {
+            "ping -n 5 127.0.0.1 > nul"
+        } else {
+            "sleep 5"
+        };
+        let result = timeout(
+            Duration::from_secs(3),
+            run_command(
+                command,
+                Path::new(&workspace),
+                Duration::from_millis(100),
+                Arc::new(|_: &str, _: &str| Ok(())),
+            ),
+        )
+        .await
+        .expect("command runner enforces timeout");
+        assert!(
+            result
+                .expect_err("command times out")
+                .contains("timed out after 100 ms")
+        );
     }
 }
