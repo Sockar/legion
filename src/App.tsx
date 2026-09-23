@@ -1,5 +1,6 @@
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { FileChangeReview } from "./components/FileChangeReview";
 import { ChatInput } from "./components/ChatInput";
 import { MessageList } from "./components/MessageList";
 import { SessionSidebar } from "./components/SessionSidebar";
@@ -64,6 +65,7 @@ function App() {
   const [toolApprovals, setToolApprovals] = useState<
     { approval: ToolApprovalRequest; sessionId: string }[]
   >([]);
+  const [resolvingApprovalId, setResolvingApprovalId] = useState<string>();
   const controllersRef = useRef(new Map<string, AbortController>());
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -76,6 +78,12 @@ function App() {
     ? streamingSessionIds.has(activeSession.id)
     : false;
   const currentToolApproval = toolApprovals[0]?.approval;
+  const inlineFileApproval =
+    activeSession &&
+    toolApprovals[0]?.sessionId === activeSession.id &&
+    currentToolApproval?.preview
+      ? currentToolApproval
+      : undefined;
 
   useEffect(() => {
     try {
@@ -402,7 +410,8 @@ function App() {
 
   const handleToolApproval = useCallback(
     async (approved: boolean) => {
-      if (!currentToolApproval) return;
+      if (!currentToolApproval || resolvingApprovalId) return;
+      setResolvingApprovalId(currentToolApproval.approval_id);
       try {
         await respondToToolApproval(currentToolApproval.approval_id, approved);
         setToolApprovals((current) =>
@@ -413,9 +422,11 @@ function App() {
         );
       } catch (error) {
         setRuntimeError(errorMessage(error));
+      } finally {
+        setResolvingApprovalId(undefined);
       }
     },
-    [currentToolApproval],
+    [currentToolApproval, resolvingApprovalId],
   );
 
   const handleRegenerate = useCallback(
@@ -551,7 +562,7 @@ function App() {
         </p>
       )}
 
-      {currentToolApproval && (
+      {currentToolApproval && !inlineFileApproval && (
         <div className="tool-approval-backdrop">
           <section
             className="tool-approval"
@@ -559,27 +570,52 @@ function App() {
             aria-modal="true"
             aria-labelledby="tool-approval-title"
           >
-            <h2 id="tool-approval-title">Allow tool execution?</h2>
-            <p>
-              <strong>{currentToolApproval.tool.name}</strong>
-              {`: ${currentToolApproval.tool.description}`}
-            </p>
-            <pre>{JSON.stringify(currentToolApproval.arguments, null, 2)}</pre>
-            <div className="tool-approval__actions">
-              <button
-                type="button"
-                onClick={() => void handleToolApproval(false)}
-              >
-                Deny
-              </button>
-              <button
-                className="tool-approval__allow"
-                type="button"
-                onClick={() => void handleToolApproval(true)}
-              >
-                Allow once
-              </button>
-            </div>
+            <h2 id="tool-approval-title">
+              {currentToolApproval.preview
+                ? "Review proposed file change"
+                : "Allow tool execution?"}
+            </h2>
+            {currentToolApproval.preview ? (
+              <FileChangeReview
+                preview={currentToolApproval.preview}
+                disabled={
+                  resolvingApprovalId === currentToolApproval.approval_id
+                }
+                onAccept={() => void handleToolApproval(true)}
+                onReject={() => void handleToolApproval(false)}
+              />
+            ) : (
+              <>
+                <p>
+                  <strong>{currentToolApproval.tool.name}</strong>
+                  {`: ${currentToolApproval.tool.description}`}
+                </p>
+                <pre>
+                  {JSON.stringify(currentToolApproval.arguments, null, 2)}
+                </pre>
+                <div className="tool-approval__actions">
+                  <button
+                    type="button"
+                    disabled={
+                      resolvingApprovalId === currentToolApproval.approval_id
+                    }
+                    onClick={() => void handleToolApproval(false)}
+                  >
+                    Deny
+                  </button>
+                  <button
+                    className="tool-approval__allow"
+                    type="button"
+                    disabled={
+                      resolvingApprovalId === currentToolApproval.approval_id
+                    }
+                    onClick={() => void handleToolApproval(true)}
+                  >
+                    Allow once
+                  </button>
+                </div>
+              </>
+            )}
           </section>
         </div>
       )}
@@ -635,6 +671,16 @@ function App() {
                   messages={messages}
                   isStreaming={isStreaming}
                   onRegenerate={handleRegenerate}
+                />
+              )}
+              {inlineFileApproval?.preview && (
+                <FileChangeReview
+                  preview={inlineFileApproval.preview}
+                  disabled={
+                    resolvingApprovalId === inlineFileApproval.approval_id
+                  }
+                  onAccept={() => void handleToolApproval(true)}
+                  onReject={() => void handleToolApproval(false)}
                 />
               )}
               <div ref={bottomRef} />

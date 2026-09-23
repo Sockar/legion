@@ -333,6 +333,7 @@ pub struct ToolApprovalRequest {
     pub approval_id: String,
     pub tool: ToolSchema,
     pub arguments: Value,
+    pub preview: Option<Value>,
 }
 
 #[async_trait]
@@ -443,6 +444,32 @@ async fn run_tool_loop(
             }
             let result = if let Some(tool) = tools.get(&call.function.name) {
                 let schema = tool.schema();
+                let context = ToolContext {
+                    workspace: workspace.clone(),
+                };
+                let preview = if schema.risk_level == RiskLevel::RequiresConfirmation {
+                    match tokio::select! {
+                        _ = cancellation.cancelled() => return Ok(()),
+                        result = tool.preview(call.function.arguments.clone(), context.clone()) => result,
+                    } {
+                        Ok(preview) => preview,
+                        Err(error) => {
+                            let content = serde_json::to_string(&json!({ "error": error }))
+                                .map_err(|encode_error| {
+                                    format!("Could not encode tool result: {encode_error}")
+                                })?;
+                            request.messages.push(ChatMessage {
+                                role: "tool".to_owned(),
+                                content,
+                                tool_calls: None,
+                                tool_name: Some(call.function.name),
+                            });
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let approved = if schema.risk_level == RiskLevel::RequiresConfirmation {
                     approval_handler
                         .approve(
@@ -451,6 +478,7 @@ async fn run_tool_loop(
                                 approval_id: format!("{request_id}-{iteration}-{call_index}"),
                                 tool: schema.clone(),
                                 arguments: call.function.arguments.clone(),
+                                preview: preview.clone(),
                             },
                             cancellation.clone(),
                         )
@@ -461,13 +489,18 @@ async fn run_tool_loop(
                 if !approved {
                     json!({ "error": "User denied permission to run this tool." })
                 } else {
+                    let mut approved_arguments = call.function.arguments;
+                    if let Some(before) = preview.as_ref().and_then(|preview| preview.get("before"))
+                    {
+                        if let Some(arguments) = approved_arguments.as_object_mut() {
+                            arguments.insert("_approved_before".to_owned(), before.clone());
+                        }
+                    }
                     tokio::select! {
                         _ = cancellation.cancelled() => return Ok(()),
                         result = tool.call(
-                            call.function.arguments,
-                            ToolContext {
-                                workspace: workspace.clone(),
-                            },
+                            approved_arguments,
+                            context,
                         ) => {
                             result.unwrap_or_else(|error| json!({ "error": error }))
                         }
