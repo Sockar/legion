@@ -77,3 +77,5 @@ npm run format:check
 cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 ```
+
+See [docs/RELEASING.md](docs/RELEASING.md) for release and updater setup.

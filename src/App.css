@@ -691,8 +691,13 @@ button:disabled {
 }
 
 .settings-panel__connected,
-.settings-panel__error {
+.settings-panel__error,
+.settings-panel__update-note {
   font-size: 0.74rem;
+}
+
+.settings-panel__update-note {
+  color: #a4a5b0;
 }
 
 .settings-panel__connected {

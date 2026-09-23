@@ -1,4 +1,8 @@
 import { useState, type FormEvent } from "react";
+import { isTauri } from "@tauri-apps/api/core";
+import { confirm } from "@tauri-apps/plugin-dialog";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check } from "@tauri-apps/plugin-updater";
 import {
   DEFAULT_CHAT_SETTINGS,
   type ChatSession,
@@ -37,6 +41,44 @@ export function SettingsPanel({
   const [testError, setTestError] = useState("");
   const [isTesting, setIsTesting] = useState(false);
   const [validationError, setValidationError] = useState("");
+  const [isCheckingUpdates, setIsCheckingUpdates] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState("");
+  const [updateError, setUpdateError] = useState("");
+
+  const handleCheckForUpdates = async () => {
+    setIsCheckingUpdates(true);
+    setUpdateStatus("");
+    setUpdateError("");
+    try {
+      const update = await check();
+      if (!update) {
+        setUpdateStatus("You're up to date.");
+        return;
+      }
+
+      const notes = update.body ? `\n\n${update.body}` : "";
+      const shouldInstall = await confirm(
+        `Version ${update.version} is available. Install it now?${notes}`,
+        { title: "Update available", kind: "info" },
+      );
+      if (!shouldInstall) {
+        setUpdateStatus(`Version ${update.version} is available.`);
+        return;
+      }
+
+      setUpdateStatus("Downloading and installing update…");
+      await update.downloadAndInstall();
+      await relaunch();
+    } catch (error) {
+      setUpdateError(
+        `Unable to check for updates: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    } finally {
+      setIsCheckingUpdates(false);
+    }
+  };
 
   const updateNumber = (
     key: "temperature" | "topP" | "numCtx",
@@ -232,6 +274,38 @@ export function SettingsPanel({
                 {testError && (
                   <span className="settings-panel__error" role="alert">
                     {testError}
+                  </span>
+                )}
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>Application updates</legend>
+              <div className="settings-panel__connection">
+                <button
+                  disabled={!isTauri() || isCheckingUpdates}
+                  onClick={() => void handleCheckForUpdates()}
+                  type="button"
+                >
+                  {isCheckingUpdates ? "Checking…" : "Check for updates"}
+                </button>
+                {!isTauri() && (
+                  <span className="settings-panel__update-note">
+                    Updates are available in the desktop app.
+                  </span>
+                )}
+                {updateStatus && (
+                  <span
+                    className="settings-panel__connected"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    {updateStatus}
+                  </span>
+                )}
+                {updateError && (
+                  <span className="settings-panel__error" role="alert">
+                    {updateError}
                   </span>
                 )}
               </div>

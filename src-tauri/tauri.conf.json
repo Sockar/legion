@@ -31,5 +31,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "__TAURI_UPDATER_PUBLIC_KEY__",
+      "endpoints": [
+        "https://github.com/sockar/legion/releases/latest/download/latest.json"
+      ]
+    }
   }
 }
