@@ -9,6 +9,11 @@ copying, powered by the local [Ollama](https://ollama.com/) HTTP API. The app
 detects the server at `http://localhost:11434`, lists installed models, streams
 model-pull progress, and streams chat responses.
 
+Chat sessions are stored locally and restored when the app restarts. Each
+session keeps its own conversation and model selection and is associated with a
+workspace folder chosen through the native folder picker. Session persistence is
+behind a repository interface so the storage can be replaced with SQLite later.
+
 ## Development
 
 ### Prerequisites
