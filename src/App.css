@@ -524,6 +524,68 @@ button:disabled {
   font-size: 0.78rem;
 }
 
+.tool-approval-backdrop {
+  position: fixed;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: #0009;
+  inset: 0;
+}
+
+.tool-approval {
+  width: min(100%, 480px);
+  border: 1px solid #454650;
+  border-radius: 12px;
+  padding: 20px;
+  background: #191a1f;
+  box-shadow: 0 16px 48px #0008;
+}
+
+.tool-approval h2 {
+  margin: 0 0 12px;
+  font-size: 1.05rem;
+}
+
+.tool-approval p {
+  color: #c5c6ce;
+  font-size: 0.86rem;
+  line-height: 1.5;
+}
+
+.tool-approval pre {
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid #34353d;
+  border-radius: 7px;
+  padding: 10px;
+  background: #121317;
+  color: #d8d8dd;
+  font-size: 0.78rem;
+}
+
+.tool-approval__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.tool-approval__actions button {
+  border: 1px solid #454650;
+  border-radius: 7px;
+  padding: 7px 12px;
+  background: #202127;
+  color: #e5e5e9;
+}
+
+.tool-approval__actions .tool-approval__allow {
+  border-color: #a5aaff;
+  background: #c4c8ff;
+  color: #1a1b24;
+}
+
 @media (max-width: 900px) {
   .chat-header {
     flex-wrap: wrap;

@@ -16,8 +16,39 @@ export interface ModelInfo {
 }
 
 export interface ChatMessage {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
+  tool_calls?: ToolCall[];
+  tool_name?: string;
+}
+
+export interface JsonSchema {
+  type: string;
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  description?: string;
+  [key: string]: unknown;
+}
+
+export interface ToolSchema {
+  name: string;
+  description: string;
+  parameters: JsonSchema;
+  risk_level: "auto_approve" | "requires_confirmation";
+}
+
+export interface ToolCall {
+  function: {
+    name: string;
+    arguments: Record<string, unknown>;
+  };
+}
+
+export interface ToolApprovalRequest {
+  request_id: string;
+  approval_id: string;
+  tool: ToolSchema;
+  arguments: Record<string, unknown>;
 }
 
 export interface ServerStatus {
@@ -70,7 +101,9 @@ export async function pullOllamaModel(
 export async function streamOllamaChat(
   model: string,
   messages: ChatMessage[],
+  workspacePath: string,
   onChunk: (chunk: ChatChunk) => void,
+  onApproval: (approval: ToolApprovalRequest) => void,
   signal?: AbortSignal,
 ): Promise<void> {
   const requestId = crypto.randomUUID();
@@ -80,13 +113,20 @@ export async function streamOllamaChat(
       if (payload.request_id === requestId) onChunk(payload);
     },
   );
+  let unlistenApproval = () => {};
   let onAbort: (() => void) | undefined;
 
   try {
+    unlistenApproval = await listen<ToolApprovalRequest>(
+      "tools://approval-request",
+      ({ payload }) => {
+        if (payload.request_id === requestId) onApproval(payload);
+      },
+    );
     if (signal?.aborted) throw new DOMException("Chat cancelled", "AbortError");
 
     const chatRequest = invoke<void>("ollama_chat", {
-      request: { model, messages },
+      request: { model, messages, workspace_path: workspacePath },
       requestId,
     });
     if (signal) {
@@ -107,5 +147,13 @@ export async function streamOllamaChat(
   } finally {
     if (onAbort) signal?.removeEventListener("abort", onAbort);
     unlisten();
+    unlistenApproval();
   }
+}
+
+export async function respondToToolApproval(
+  approvalId: string,
+  approved: boolean,
+): Promise<void> {
+  await invoke("respond_tool_approval", { approvalId, approved });
 }

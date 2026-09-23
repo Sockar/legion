@@ -14,6 +14,15 @@ session keeps its own conversation and model selection and is associated with a
 workspace folder chosen through the native folder picker. Session persistence is
 behind a repository interface so the storage can be replaced with SQLite later.
 
+Chat requests include registered function schemas. The Rust tool registry
+dispatches Ollama tool calls, returns results (including failures) to the model,
+and continues for up to eight tool iterations. Tools declare `auto_approve` or
+`requires_confirmation`; the latter prompts the user in the app before running.
+The initial read-only examples are `get_current_time` and
+`list_workspace_files`; the listing tool receives the active session's workspace
+context. New tools implement the Rust `Tool` trait and can be registered on
+`BackendState` before it is shared.
+
 ## Development
 
 ### Prerequisites
