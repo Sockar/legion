@@ -1,6 +1,6 @@
 use std::{
     path::Path,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Manager, State};
 
-const MIGRATIONS: &[(i64, &str)] = &[(
-    1,
-    "CREATE TABLE sessions (
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        1,
+        "CREATE TABLE sessions (
         id TEXT PRIMARY KEY NOT NULL,
         name TEXT NOT NULL,
         workspace_path TEXT NOT NULL,
@@ -50,7 +51,24 @@ const MIGRATIONS: &[(i64, &str)] = &[(
     );
     CREATE INDEX messages_session_id_idx ON messages(session_id);
     CREATE INDEX tool_call_history_session_id_idx ON tool_call_history(session_id);",
-)];
+    ),
+    (
+        2,
+        "ALTER TABLE session_settings
+        ADD COLUMN strict_mode INTEGER NOT NULL DEFAULT 0;
+     CREATE TABLE tool_audit_log (
+        id TEXT PRIMARY KEY NOT NULL,
+        session_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        arguments_summary TEXT NOT NULL,
+        approval_status TEXT NOT NULL,
+        execution_status TEXT NOT NULL,
+        created_at TEXT NOT NULL
+     );
+     CREATE INDEX tool_audit_log_session_id_idx
+        ON tool_audit_log(session_id, created_at);",
+    ),
+];
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +81,8 @@ pub struct ChatSettings {
     pub num_ctx: i64,
     #[serde(default)]
     pub system_prompt: String,
+    #[serde(default)]
+    pub strict_mode: bool,
 }
 
 impl Default for ChatSettings {
@@ -72,6 +92,7 @@ impl Default for ChatSettings {
             top_p: default_top_p(),
             num_ctx: default_num_ctx(),
             system_prompt: String::new(),
+            strict_mode: false,
         }
     }
 }
@@ -96,6 +117,18 @@ pub struct ToolCallHistory {
     pub arguments: Value,
     pub result: Value,
     pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAuditRecord {
+    pub id: String,
+    pub session_id: String,
+    pub tool_name: String,
+    pub arguments_summary: String,
+    pub approval_status: String,
+    pub execution_status: String,
     pub created_at: String,
 }
 
@@ -128,6 +161,8 @@ pub struct PersistedSessionState {
     pub active_session_id: Option<String>,
     #[serde(default = "default_ollama_endpoint")]
     pub ollama_endpoint: String,
+    #[serde(default)]
+    pub tool_audit_log: Vec<ToolAuditRecord>,
 }
 
 impl Default for PersistedSessionState {
@@ -136,6 +171,7 @@ impl Default for PersistedSessionState {
             sessions: Vec::new(),
             active_session_id: None,
             ollama_endpoint: default_ollama_endpoint(),
+            tool_audit_log: Vec::new(),
         }
     }
 }
@@ -144,7 +180,7 @@ pub struct Database {
     connection: Connection,
 }
 
-pub struct PersistenceState(pub Mutex<Database>);
+pub struct PersistenceState(pub Arc<Mutex<Database>>);
 
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
@@ -175,6 +211,27 @@ impl Database {
         let transaction = self.connection.transaction().map_err(storage_error)?;
         write_state(&transaction, state)?;
         transaction.commit().map_err(storage_error)
+    }
+
+    pub fn append_tool_audit_log(&mut self, record: &ToolAuditRecord) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT INTO tool_audit_log
+                 (id, session_id, tool_name, arguments_summary, approval_status,
+                  execution_status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    record.id,
+                    record.session_id,
+                    record.tool_name,
+                    record.arguments_summary,
+                    record.approval_status,
+                    record.execution_status,
+                    record.created_at,
+                ],
+            )
+            .map_err(storage_error)?;
+        Ok(())
     }
 
     fn load_from_database(&self) -> Result<PersistedSessionState, String> {
@@ -224,7 +281,7 @@ impl Database {
             let settings = self
                 .connection
                 .query_row(
-                    "SELECT temperature, top_p, num_ctx, system_prompt
+                    "SELECT temperature, top_p, num_ctx, system_prompt, strict_mode
                      FROM session_settings WHERE session_id = ?1",
                     [&id],
                     |row| {
@@ -233,6 +290,7 @@ impl Database {
                             top_p: row.get(1)?,
                             num_ctx: row.get(2)?,
                             system_prompt: row.get(3)?,
+                            strict_mode: row.get(4)?,
                         })
                     },
                 )
@@ -311,10 +369,37 @@ impl Database {
             });
         }
 
+        let mut tool_audit_log = Vec::new();
+        let mut audit_statement = self
+            .connection
+            .prepare(
+                "SELECT id, session_id, tool_name, arguments_summary,
+                        approval_status, execution_status, created_at
+                 FROM tool_audit_log ORDER BY rowid",
+            )
+            .map_err(storage_error)?;
+        let audit_rows = audit_statement
+            .query_map([], |row| {
+                Ok(ToolAuditRecord {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    tool_name: row.get(2)?,
+                    arguments_summary: row.get(3)?,
+                    approval_status: row.get(4)?,
+                    execution_status: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .map_err(storage_error)?;
+        for record in audit_rows {
+            tool_audit_log.push(record.map_err(storage_error)?);
+        }
+
         Ok(PersistedSessionState {
             sessions,
             active_session_id,
             ollama_endpoint: endpoint,
+            tool_audit_log,
         })
     }
 }
@@ -369,14 +454,15 @@ fn write_state(transaction: &Transaction<'_>, state: &PersistedSessionState) -> 
         transaction
             .execute(
                 "INSERT INTO session_settings
-                 (session_id, temperature, top_p, num_ctx, system_prompt)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (session_id, temperature, top_p, num_ctx, system_prompt, strict_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     session.id,
                     session.settings.temperature,
                     session.settings.top_p,
                     session.settings.num_ctx,
                     session.settings.system_prompt,
+                    session.settings.strict_mode,
                 ],
             )
             .map_err(storage_error)?;
@@ -557,7 +643,7 @@ pub fn initialize(app: &AppHandle) -> Result<PersistenceState, String> {
         .map_err(|error| format!("Could not create the app data directory: {error}"))?;
     let database = Database::open(directory.join("legion.sqlite3"))
         .map_err(|error| format!("Could not open the session database: {error}"))?;
-    Ok(PersistenceState(Mutex::new(database)))
+    Ok(PersistenceState(Arc::new(Mutex::new(database))))
 }
 
 #[cfg(test)]
@@ -587,6 +673,7 @@ mod tests {
                     top_p: 0.8,
                     num_ctx: 8192,
                     system_prompt: "Be concise".to_owned(),
+                    strict_mode: true,
                 },
                 archived_at: None,
                 tool_call_history: vec![super::ToolCallHistory {
@@ -600,6 +687,7 @@ mod tests {
             }],
             active_session_id: Some("session-1".to_owned()),
             ollama_endpoint: "http://localhost:11434".to_owned(),
+            tool_audit_log: Vec::new(),
         }
     }
 
@@ -615,13 +703,13 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
                  AND name IN ('sessions', 'messages', 'session_settings',
-                              'app_settings', 'tool_call_history')",
+                              'app_settings', 'tool_call_history', 'tool_audit_log')",
                 [],
                 |row| row.get(0),
             )
             .expect("schema tables can be counted");
-        assert_eq!(version, 1);
-        assert_eq!(table_count, 5);
+        assert_eq!(version, 2);
+        assert_eq!(table_count, 6);
     }
 
     #[test]
@@ -712,5 +800,31 @@ mod tests {
         assert_eq!(session.messages[0].content, "old message");
         assert!(!session.messages[0].created_at.is_empty());
         assert_eq!(session.tool_call_history, Vec::new());
+        assert!(!session.settings.strict_mode);
+    }
+
+    #[test]
+    fn appends_and_loads_tool_audit_records() {
+        let mut database = Database {
+            connection: Connection::open_in_memory().expect("in-memory db opens"),
+        };
+        migrate(&mut database.connection).expect("schema migrates");
+        let record = super::ToolAuditRecord {
+            id: "request-0-0".to_owned(),
+            session_id: "session-1".to_owned(),
+            tool_name: "run_command".to_owned(),
+            arguments_summary: r#"{"command":"cargo test"}"#.to_owned(),
+            approval_status: "approved".to_owned(),
+            execution_status: "succeeded".to_owned(),
+            created_at: "2026-09-23T12:00:45.000Z".to_owned(),
+        };
+
+        database
+            .append_tool_audit_log(&record)
+            .expect("audit record appends");
+        assert_eq!(
+            database.load(None).expect("audit log loads").tool_audit_log,
+            vec![record]
+        );
     }
 }

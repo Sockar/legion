@@ -1,7 +1,9 @@
 pub mod ollama;
 pub mod persistence;
 pub mod search;
+pub mod security;
 pub mod tools;
+pub mod workspace;
 
 use tauri::Manager;
 

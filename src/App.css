@@ -632,6 +632,37 @@ button:disabled {
   font-size: 0.67rem;
 }
 
+.settings-panel__toggle {
+  grid-template-columns: auto 1fr;
+  align-items: start;
+}
+
+.settings-panel__toggle input {
+  width: auto;
+  margin: 2px 0 0;
+}
+
+.settings-panel__audit-log {
+  display: grid;
+  gap: 8px;
+  max-height: 220px;
+  overflow: auto;
+  margin: 0;
+  padding-left: 20px;
+  color: #c5c6ce;
+  font-size: 0.72rem;
+}
+
+.settings-panel__audit-log pre {
+  overflow: auto;
+  margin: 8px 0 2px;
+  padding: 8px;
+  border-radius: 6px;
+  background: #121317;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .settings-panel input,
 .settings-panel select,
 .settings-panel textarea {

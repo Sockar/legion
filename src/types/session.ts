@@ -5,6 +5,7 @@ export interface ChatSettings {
   topP: number;
   numCtx: number;
   systemPrompt: string;
+  strictMode: boolean;
 }
 
 export const DEFAULT_CHAT_SETTINGS: ChatSettings = {
@@ -12,6 +13,7 @@ export const DEFAULT_CHAT_SETTINGS: ChatSettings = {
   topP: 0.9,
   numCtx: 4096,
   systemPrompt: "",
+  strictMode: false,
 };
 
 export interface ChatSession {
@@ -36,8 +38,19 @@ export interface ToolCallHistory {
   createdAt: string;
 }
 
+export interface ToolAuditRecord {
+  id: string;
+  sessionId: string;
+  toolName: string;
+  argumentsSummary: string;
+  approvalStatus: string;
+  executionStatus: string;
+  createdAt: string;
+}
+
 export interface PersistedSessionState {
   sessions: ChatSession[];
   activeSessionId: string | null;
   ollamaEndpoint: string;
+  toolAuditLog: ToolAuditRecord[];
 }

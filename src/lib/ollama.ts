@@ -75,8 +75,10 @@ export interface ToolCallEvent {
   request_id: string;
   tool_name: string;
   arguments: Record<string, unknown>;
+  arguments_summary: string;
   result: unknown;
   status: string;
+  approval_status: string;
   created_at: string;
 }
 
@@ -129,6 +131,7 @@ export async function pullOllamaModel(
 }
 
 export async function streamOllamaChat(
+  sessionId: string,
   model: string,
   messages: ChatMessage[],
   workspacePath: string,
@@ -179,6 +182,8 @@ export async function streamOllamaChat(
         messages,
         workspace_path: workspacePath,
         endpoint,
+        session_id: sessionId,
+        strict_mode: settings.strictMode,
         options: {
           temperature: settings.temperature,
           top_p: settings.topP,

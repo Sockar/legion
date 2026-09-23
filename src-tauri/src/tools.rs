@@ -16,7 +16,11 @@ use tokio::{
     time::{timeout, Duration},
 };
 
-use crate::search::{GlobSearch, GrepSearch, IndexWorkspace, SemanticSearch};
+use crate::{
+    search::{GlobSearch, GrepSearch, IndexWorkspace, SemanticSearch},
+    security::blocked_command_reason,
+    workspace::resolve_workspace_path,
+};
 
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 60_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 600_000;
@@ -237,7 +241,8 @@ impl Tool for ListWorkspaceFiles {
     }
 
     async fn call(&self, _arguments: Value, context: ToolContext) -> Result<Value, String> {
-        let entries = fs::read_dir(&context.workspace)
+        let workspace = resolve_workspace_path(&context.workspace, Path::new("."), true)?;
+        let entries = fs::read_dir(&workspace)
             .map_err(|error| format!("Could not list workspace: {error}"))?;
         let mut files = entries
             .map(|entry| {
@@ -279,7 +284,7 @@ impl Tool for ReadFile {
 
     async fn call(&self, arguments: Value, context: ToolContext) -> Result<Value, String> {
         let relative_path = argument_string(&arguments, "path")?;
-        let path = resolve_workspace_path(&context.workspace, relative_path, true)?;
+        let path = resolve_workspace_path(&context.workspace, Path::new(relative_path), true)?;
         let content = fs::read_to_string(&path)
             .map_err(|error| format!("Could not read {relative_path}: {error}"))?;
         Ok(json!({ "path": relative_path, "content": content }))
@@ -325,8 +330,7 @@ impl Tool for CreateFile {
         let (relative_path, before, content) = create_file_change(&arguments, &context.workspace)?;
         ensure_approved_snapshot(&arguments, &before)?;
         let overwrite = argument_bool(&arguments, "overwrite", false)?;
-        let path =
-            resolve_workspace_path(&context.workspace, &relative_path.to_string_lossy(), false)?;
+        let path = resolve_workspace_path(&context.workspace, &relative_path, false)?;
         if overwrite {
             fs::write(&path, content)
                 .map_err(|error| format!("Could not write {}: {error}", relative_path.display()))?;
@@ -388,8 +392,7 @@ impl Tool for EditFile {
     async fn call(&self, arguments: Value, context: ToolContext) -> Result<Value, String> {
         let (relative_path, before, after) = edit_file_change(&arguments, &context.workspace)?;
         ensure_approved_snapshot(&arguments, &before)?;
-        let path =
-            resolve_workspace_path(&context.workspace, &relative_path.to_string_lossy(), true)?;
+        let path = resolve_workspace_path(&context.workspace, &relative_path, true)?;
         fs::write(&path, after)
             .map_err(|error| format!("Could not write {}: {error}", relative_path.display()))?;
         Ok(json!({ "path": relative_path, "edited": true }))
@@ -424,51 +427,6 @@ fn argument_bool(arguments: &Value, key: &str, default: bool) -> Result<bool, St
     }
 }
 
-fn resolve_workspace_path(
-    workspace: &Path,
-    relative_path: &str,
-    require_existing: bool,
-) -> Result<PathBuf, String> {
-    let relative_path = Path::new(relative_path);
-    if relative_path.as_os_str().is_empty() || relative_path.is_absolute() {
-        return Err("File path must be a non-empty path relative to the workspace".to_owned());
-    }
-
-    let root = fs::canonicalize(workspace)
-        .map_err(|error| format!("Could not resolve workspace folder: {error}"))?;
-    if !root.is_dir() {
-        return Err("Workspace path is not a directory".to_owned());
-    }
-    let candidate = root.join(relative_path);
-    if candidate.exists() {
-        let resolved = fs::canonicalize(&candidate)
-            .map_err(|error| format!("Could not resolve file path: {error}"))?;
-        if !resolved.starts_with(&root) {
-            return Err("File path escapes the workspace folder".to_owned());
-        }
-        if !resolved.is_file() {
-            return Err("File path must refer to a file".to_owned());
-        }
-        return Ok(resolved);
-    }
-    if require_existing {
-        return Err(format!("File does not exist: {}", relative_path.display()));
-    }
-
-    let file_name = candidate
-        .file_name()
-        .ok_or_else(|| "File path must include a file name".to_owned())?;
-    let parent = candidate
-        .parent()
-        .ok_or_else(|| "File path must have a workspace folder".to_owned())?;
-    let resolved_parent = fs::canonicalize(parent)
-        .map_err(|error| format!("Could not resolve parent folder: {error}"))?;
-    if !resolved_parent.starts_with(&root) {
-        return Err("File path escapes the workspace folder".to_owned());
-    }
-    Ok(resolved_parent.join(file_name))
-}
-
 fn create_file_change(
     arguments: &Value,
     workspace: &Path,
@@ -476,7 +434,7 @@ fn create_file_change(
     let relative_path = PathBuf::from(argument_string(arguments, "path")?);
     let content = argument_string(arguments, "content")?.to_owned();
     let overwrite = argument_bool(arguments, "overwrite", false)?;
-    let path = resolve_workspace_path(workspace, &relative_path.to_string_lossy(), false)?;
+    let path = resolve_workspace_path(workspace, &relative_path, false)?;
     let before = if path.exists() {
         if !overwrite {
             return Err(format!(
@@ -502,7 +460,7 @@ fn edit_file_change(
     if old_str.is_empty() {
         return Err("old_str cannot be empty; provide specific context to replace".to_owned());
     }
-    let path = resolve_workspace_path(workspace, &relative_path.to_string_lossy(), true)?;
+    let path = resolve_workspace_path(workspace, &relative_path, true)?;
     let before = fs::read_to_string(&path)
         .map_err(|error| format!("Could not read {}: {error}", relative_path.display()))?;
     let start = before
@@ -537,7 +495,7 @@ impl Tool for RunCommand {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "run_command".to_owned(),
-            description: "Run a shell command in the active workspace directory. Commands are not sandboxed; broader sandboxing is tracked separately in issue #12.".to_owned(),
+            description: "Run a shell command in the active workspace directory. Selected destructive command patterns are rejected before approval; other commands require confirmation. Commands are not sandboxed.".to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -576,12 +534,14 @@ impl Tool for RunCommand {
             .transpose()?
             .unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS);
 
-        let workspace = context
-            .workspace
-            .canonicalize()
-            .map_err(|error| format!("Could not access workspace directory: {error}"))?;
+        let workspace = resolve_workspace_path(&context.workspace, Path::new("."), true)?;
         if !workspace.is_dir() {
             return Err("Workspace path is not a directory".to_owned());
+        }
+        if let Some(reason) = blocked_command_reason(&command)? {
+            return Err(format!(
+                "Command rejected by the dangerous-command blocklist: {reason}"
+            ));
         }
 
         emit_command_event(
@@ -924,16 +884,8 @@ mod tests {
         fs::write(root.join("outside.txt"), "outside").expect("outside file is written");
         let outside_file = PathBuf::from("..").join("outside.txt");
         let outside_new_file = PathBuf::from("..").join("new.txt");
-        assert!(
-            resolve_workspace_path(&workspace, &outside_file.to_string_lossy(), true)
-                .unwrap_err()
-                .contains("escapes")
-        );
-        assert!(
-            resolve_workspace_path(&workspace, &outside_new_file.to_string_lossy(), false)
-                .unwrap_err()
-                .contains("escapes")
-        );
+        assert!(resolve_workspace_path(&workspace, &outside_file, true).is_err());
+        assert!(resolve_workspace_path(&workspace, &outside_new_file, false).is_err());
         fs::remove_dir_all(root).expect("temporary workspace is removed");
     }
 

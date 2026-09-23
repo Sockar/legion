@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use crate::persistence::{PersistenceState, ToolAuditRecord};
 use crate::tools::{
     CommandOutputCallback, RiskLevel, Tool, ToolCall, ToolContext, ToolDefinition, ToolRegistry,
     ToolSchema, COMMAND_OUTPUT_EVENT,
@@ -36,8 +37,10 @@ pub struct ToolCallEvent {
     pub request_id: String,
     pub tool_name: String,
     pub arguments: Value,
+    pub arguments_summary: String,
     pub result: Value,
     pub status: String,
+    pub approval_status: String,
     pub created_at: String,
 }
 
@@ -324,6 +327,10 @@ pub struct ChatRequest {
     pub endpoint: String,
     #[serde(default)]
     pub options: ChatOptions,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub strict_mode: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -558,6 +565,7 @@ async fn run_tool_loop(
                 return Ok(());
             }
             let call_arguments = call.function.arguments.clone();
+            let mut approval_status = "approved";
             let result = if let Some(tool) = tools.get(&call.function.name) {
                 let schema = tool.schema();
                 let context = ToolContext {
@@ -566,90 +574,105 @@ async fn run_tool_loop(
                     command_id: format!("{request_id}-{iteration}-{call_index}"),
                     command_output: Some(callbacks.command_output.clone()),
                 };
-                let preview = if schema.risk_level == RiskLevel::RequiresConfirmation {
-                    match tokio::select! {
-                        _ = cancellation.cancelled() => return Ok(()),
-                        result = tool.preview(call.function.arguments.clone(), context.clone()) => result,
-                    } {
-                        Ok(preview) => preview,
-                        Err(error) => {
-                            let result = json!({ "error": error });
-                            (callbacks.on_tool_call)(ToolCallEvent {
-                                id: format!("{request_id}-{iteration}-{call_index}"),
-                                request_id: request_id.to_owned(),
-                                tool_name: call.function.name.clone(),
-                                arguments: call.function.arguments.clone(),
-                                result: result.clone(),
-                                status: "failed".to_owned(),
-                                created_at: unix_timestamp(),
-                            })?;
-                            let content =
-                                serde_json::to_string(&result).map_err(|encode_error| {
-                                    format!("Could not encode tool result: {encode_error}")
-                                })?;
-                            request.messages.push(ChatMessage {
-                                role: "tool".to_owned(),
-                                content,
-                                tool_calls: None,
-                                tool_name: Some(call.function.name),
-                            });
-                            continue;
-                        }
-                    }
+                let blocked_reason = if call.function.name == "run_command" {
+                    call_arguments
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .map(crate::security::blocked_command_reason)
+                        .transpose()?
+                        .flatten()
                 } else {
                     None
                 };
-                let approved = if schema.risk_level == RiskLevel::RequiresConfirmation {
-                    callbacks
-                        .approval_handler
-                        .approve(
-                            ToolApprovalRequest {
-                                request_id: request_id.to_owned(),
-                                approval_id: format!("{request_id}-{iteration}-{call_index}"),
-                                tool: schema.clone(),
-                                arguments: call.function.arguments.clone(),
-                                preview: preview.clone(),
-                            },
-                            cancellation.clone(),
-                        )
-                        .await?
+                if let Some(reason) = blocked_reason {
+                    approval_status = "rejected";
+                    json!({ "error": format!("Command rejected by the dangerous-command blocklist: {reason}") })
                 } else {
-                    true
-                };
-                if !approved {
-                    json!({ "error": "User denied permission to run this tool." })
-                } else {
-                    let mut approved_arguments = call_arguments.clone();
-                    if let Some(before) = preview.as_ref().and_then(|preview| preview.get("before"))
-                    {
-                        if let Some(arguments) = approved_arguments.as_object_mut() {
-                            arguments.insert("_approved_before".to_owned(), before.clone());
+                    let requires_confirmation =
+                        request.strict_mode || schema.risk_level == RiskLevel::RequiresConfirmation;
+                    let mut rejection_result = None;
+                    let preview = if requires_confirmation {
+                        match tokio::select! {
+                            _ = cancellation.cancelled() => return Ok(()),
+                            result = tool.preview(call_arguments.clone(), context.clone()) => result,
+                        } {
+                            Ok(preview) => preview,
+                            Err(error) => {
+                                approval_status = "rejected";
+                                rejection_result = Some(json!({ "error": error }));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if requires_confirmation && rejection_result.is_none() {
+                        let approved = callbacks
+                            .approval_handler
+                            .approve(
+                                ToolApprovalRequest {
+                                    request_id: request_id.to_owned(),
+                                    approval_id: format!("{request_id}-{iteration}-{call_index}"),
+                                    tool: schema.clone(),
+                                    arguments: call_arguments.clone(),
+                                    preview: preview.clone(),
+                                },
+                                cancellation.clone(),
+                            )
+                            .await;
+                        let approved = match approved {
+                            Ok(approved) => approved,
+                            Err(error) => {
+                                approval_status = "rejected";
+                                rejection_result = Some(json!({ "error": error }));
+                                false
+                            }
+                        };
+                        if !approved && rejection_result.is_none() {
+                            approval_status = "rejected";
+                            rejection_result = Some(
+                                json!({ "error": "User denied permission to run this tool." }),
+                            );
                         }
                     }
-                    tokio::select! {
-                        _ = cancellation.cancelled() => return Ok(()),
-                        result = tool.call(
-                            approved_arguments,
-                            context.clone(),
-                        ) => {
-                            result.unwrap_or_else(|error| json!({ "error": error }))
+                    match rejection_result {
+                        Some(result) => result,
+                        None => {
+                            let mut approved_arguments = call_arguments.clone();
+                            if let Some(before) =
+                                preview.as_ref().and_then(|preview| preview.get("before"))
+                            {
+                                if let Some(arguments) = approved_arguments.as_object_mut() {
+                                    arguments.insert("_approved_before".to_owned(), before.clone());
+                                }
+                            }
+                            tokio::select! {
+                                _ = cancellation.cancelled() => return Ok(()),
+                                result = tool.call(approved_arguments, context.clone()) => {
+                                    result.unwrap_or_else(|error| json!({ "error": error }))
+                                }
+                            }
                         }
                     }
                 }
             } else {
+                approval_status = "rejected";
                 json!({ "error": format!("Tool '{}' is not registered.", call.function.name) })
             };
 
+            let execution_status = execution_status(&result, approval_status);
             (callbacks.on_tool_call)(ToolCallEvent {
                 id: format!("{request_id}-{iteration}-{call_index}"),
                 request_id: request_id.to_owned(),
                 tool_name: call.function.name.clone(),
                 arguments: call_arguments,
-                status: if result.get("error").is_some() {
-                    "failed".to_owned()
+                arguments_summary: summarize_tool_arguments(&call.function.arguments)?,
+                status: if approval_status == "rejected" {
+                    "rejected".to_owned()
                 } else {
-                    "succeeded".to_owned()
+                    execution_status.to_owned()
                 },
+                approval_status: approval_status.to_owned(),
                 result: result.clone(),
                 created_at: unix_timestamp(),
             })?;
@@ -679,6 +702,37 @@ fn unix_timestamp() -> String {
         |_| "0".to_owned(),
         |duration| duration.as_millis().to_string(),
     )
+}
+
+fn execution_status(result: &Value, approval_status: &str) -> &'static str {
+    if approval_status == "rejected" {
+        "not_run"
+    } else if result.get("error").is_some()
+        || result
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .is_some_and(|exit_code| exit_code != 0)
+    {
+        "failed"
+    } else {
+        "succeeded"
+    }
+}
+
+fn summarize_tool_arguments(arguments: &Value) -> Result<String, String> {
+    const MAX_SUMMARY_CHARACTERS: usize = 2_000;
+    let encoded = serde_json::to_string(arguments)
+        .map_err(|error| format!("Could not summarize tool arguments: {error}"))?;
+    let mut characters = encoded.chars();
+    let summary = characters
+        .by_ref()
+        .take(MAX_SUMMARY_CHARACTERS)
+        .collect::<String>();
+    if characters.next().is_some() {
+        Ok(format!("{summary}...[truncated]"))
+    } else {
+        Ok(summary)
+    }
 }
 
 #[tauri::command]
@@ -723,6 +777,7 @@ pub async fn ollama_pull_model(
 pub async fn ollama_chat(
     app: AppHandle,
     backend: State<'_, BackendState>,
+    persistence: State<'_, PersistenceState>,
     mut request: ChatRequest,
     request_id: String,
 ) -> Result<(), String> {
@@ -761,8 +816,23 @@ pub async fn ollama_chat(
             .emit(COMMAND_OUTPUT_EVENT, event)
             .map_err(|error| format!("Could not emit command output: {error}"))
     });
+    let audit_session_id = request.session_id.clone();
+    let audit_database = persistence.0.clone();
     let tool_call_app = app.clone();
     let on_tool_call: ToolCallCallback = Arc::new(move |event| {
+        audit_database
+            .lock()
+            .map_err(|error| format!("Could not access SQLite audit log: {error}"))?
+            .append_tool_audit_log(&ToolAuditRecord {
+                id: event.id.clone(),
+                session_id: audit_session_id.clone(),
+                tool_name: event.tool_name.clone(),
+                arguments_summary: event.arguments_summary.clone(),
+                approval_status: event.approval_status.clone(),
+                execution_status: execution_status(&event.result, &event.approval_status)
+                    .to_owned(),
+                created_at: event.created_at.clone(),
+            })?;
         tool_call_app
             .emit(TOOL_CALL_EVENT, event)
             .map_err(|error| format!("Could not emit tool call history: {error}"))
@@ -1054,6 +1124,7 @@ mod tests {
     }
 
     struct TestTool {
+        name: &'static str,
         risk_level: RiskLevel,
         calls: AtomicUsize,
         fails: bool,
@@ -1064,7 +1135,7 @@ mod tests {
     impl Tool for TestTool {
         fn schema(&self) -> ToolSchema {
             ToolSchema {
-                name: "test_tool".to_owned(),
+                name: self.name.to_owned(),
                 description: "A test tool.".to_owned(),
                 parameters: json!({ "type": "object" }),
                 risk_level: self.risk_level.clone(),
@@ -1083,13 +1154,17 @@ mod tests {
     }
 
     fn tool_call_response() -> ChatMessage {
+        tool_call_response_with("test_tool", json!({}))
+    }
+
+    fn tool_call_response_with(name: &str, arguments: Value) -> ChatMessage {
         ChatMessage {
             role: "assistant".to_owned(),
             content: String::new(),
             tool_calls: Some(vec![ToolCall {
                 function: ToolFunctionCall {
-                    name: "test_tool".to_owned(),
-                    arguments: json!({}),
+                    name: name.to_owned(),
+                    arguments,
                 },
             }]),
             tool_name: None,
@@ -1111,6 +1186,8 @@ mod tests {
             workspace_path: Some(std::path::PathBuf::from("test-workspace")),
             endpoint: super::DEFAULT_OLLAMA_ENDPOINT.to_owned(),
             options: super::ChatOptions::default(),
+            session_id: "session".to_owned(),
+            strict_mode: false,
             messages: vec![ChatMessage {
                 role: "user".to_owned(),
                 content: "run it".to_owned(),
@@ -1144,6 +1221,7 @@ mod tests {
     async fn reports_tool_failures_to_model_and_reaches_final_answer() {
         let backend = MockBackend::new(vec![tool_call_response(), final_response()]);
         let tool = Arc::new(TestTool {
+            name: "test_tool",
             risk_level: RiskLevel::AutoApprove,
             calls: AtomicUsize::new(0),
             fails: true,
@@ -1201,6 +1279,7 @@ mod tests {
     async fn waits_for_confirmation_and_skips_a_denied_tool() {
         let backend = MockBackend::new(vec![tool_call_response(), final_response()]);
         let tool = Arc::new(TestTool {
+            name: "test_tool",
             risk_level: RiskLevel::RequiresConfirmation,
             calls: AtomicUsize::new(0),
             fails: false,
@@ -1242,9 +1321,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocklisted_commands_are_rejected_before_approval() {
+        let backend = MockBackend::new(vec![
+            tool_call_response_with("run_command", json!({ "command": "rm -rf /" })),
+            final_response(),
+        ]);
+        let tool = Arc::new(TestTool {
+            name: "run_command",
+            risk_level: RiskLevel::RequiresConfirmation,
+            calls: AtomicUsize::new(0),
+            fails: false,
+            workspaces: Mutex::new(Vec::new()),
+        });
+        let mut tools = ToolRegistry::default();
+        tools.register(tool.clone()).expect("tool registers");
+        let approval = FixedApproval(true, AtomicUsize::new(0));
+        let (on_chunk, _) = callback();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = events.clone();
+        let on_tool_call: ToolCallCallback = Arc::new(move |event| {
+            captured_events.lock().unwrap().push(event);
+            Ok(())
+        });
+
+        run_tool_loop(
+            &backend,
+            &tools,
+            chat_request(),
+            "request",
+            CancellationToken::new(),
+            ToolLoopCallbacks {
+                approval_handler: &approval,
+                command_output: command_output_callback(),
+                on_chunk: &on_chunk,
+                on_tool_call: &on_tool_call,
+            },
+        )
+        .await
+        .expect("blocklisted command is returned as a tool error");
+
+        assert_eq!(approval.1.load(Ordering::SeqCst), 0);
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        let event = events
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("audit event");
+        assert_eq!(event.approval_status, "rejected");
+        assert_eq!(event.status, "rejected");
+        assert!(event.result["error"]
+            .as_str()
+            .expect("error is a string")
+            .contains("blocklist"));
+    }
+
+    #[tokio::test]
+    async fn strict_mode_requires_approval_for_auto_approved_tools() {
+        let backend = MockBackend::new(vec![tool_call_response(), final_response()]);
+        let tool = Arc::new(TestTool {
+            name: "test_tool",
+            risk_level: RiskLevel::AutoApprove,
+            calls: AtomicUsize::new(0),
+            fails: false,
+            workspaces: Mutex::new(Vec::new()),
+        });
+        let mut tools = ToolRegistry::default();
+        tools.register(tool.clone()).expect("tool registers");
+        let approval = FixedApproval(true, AtomicUsize::new(0));
+        let (on_chunk, _) = callback();
+        let mut request = chat_request();
+        request.strict_mode = true;
+
+        run_tool_loop(
+            &backend,
+            &tools,
+            request,
+            "request",
+            CancellationToken::new(),
+            ToolLoopCallbacks {
+                approval_handler: &approval,
+                command_output: command_output_callback(),
+                on_chunk: &on_chunk,
+                on_tool_call: &tool_call_callback(),
+            },
+        )
+        .await
+        .expect("strict mode call completes");
+
+        assert_eq!(approval.1.load(Ordering::SeqCst), 1);
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn stops_tool_execution_at_the_iteration_limit() {
         let backend = MockBackend::new(vec![tool_call_response(); MAX_TOOL_ITERATIONS + 1]);
         let tool = Arc::new(TestTool {
+            name: "test_tool",
             risk_level: RiskLevel::AutoApprove,
             calls: AtomicUsize::new(0),
             fails: false,
