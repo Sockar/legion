@@ -928,3 +928,124 @@ button:disabled {
     max-width: 52vw;
   }
 }
+
+.terminal-panel {
+  flex: 0 0 auto;
+  border-bottom: 1px solid #28292f;
+  padding: 11px 24px 12px;
+  background: #121317;
+}
+
+.terminal-panel__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.terminal-panel__heading h2 {
+  margin: 0;
+  color: #d8d8dd;
+  font-size: 0.76rem;
+  font-weight: 600;
+}
+
+.terminal-panel__status,
+.terminal-panel__command > span {
+  color: #999aa3;
+  font-size: 0.68rem;
+}
+
+.terminal-panel__status--running {
+  color: #e4b45d;
+}
+
+.terminal-panel__status--succeeded {
+  color: #65d69a;
+}
+
+.terminal-panel__status--failed,
+.terminal-panel__status--timed_out,
+.terminal-panel__error {
+  color: #ff9ca8;
+}
+
+.terminal-panel__status--cancelled {
+  color: #aaaab3;
+}
+
+.terminal-panel__command {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 9px;
+  margin-top: 7px;
+}
+
+.terminal-panel__command code {
+  overflow: hidden;
+  color: #d8d8dd;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-panel__error,
+.terminal-panel__empty {
+  margin: 7px 0 0;
+  font-size: 0.72rem;
+}
+
+.terminal-panel__empty {
+  color: #858690;
+}
+
+.terminal-panel__streams {
+  display: grid;
+  max-height: 180px;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 7px;
+}
+
+.terminal-panel__streams section {
+  min-width: 0;
+}
+
+.terminal-panel__streams h3 {
+  margin: 0 0 4px;
+  color: #858690;
+  font-size: 0.65rem;
+  font-weight: 500;
+}
+
+.terminal-panel__streams pre {
+  max-height: 150px;
+  min-height: 24px;
+  overflow: auto;
+  margin: 0;
+  color: #d8d8dd;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.68rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.terminal-panel__streams section:last-child pre {
+  color: #ffb6bf;
+}
+
+.tool-approval__command-label {
+  margin-bottom: 5px;
+  color: #f1f1f3 !important;
+  font-weight: 600;
+}
+
+@media (max-width: 700px) {
+  .terminal-panel {
+    padding-right: 14px;
+    padding-left: 14px;
+  }
+}

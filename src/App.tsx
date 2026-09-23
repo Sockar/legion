@@ -4,6 +4,7 @@ import { FileChangeReview } from "./components/FileChangeReview";
 import { ChatInput } from "./components/ChatInput";
 import { MessageList } from "./components/MessageList";
 import { SessionSidebar } from "./components/SessionSidebar";
+import { TerminalPanel, type TerminalOutput } from "./components/TerminalPanel";
 import {
   LocalStorageSessionRepository,
   type SessionRepository,
@@ -15,6 +16,7 @@ import {
   streamOllamaChat,
   respondToToolApproval,
   type ModelInfo,
+  type CommandOutputEvent,
   type PullProgress,
   type ServerStatus,
   type ToolApprovalRequest,
@@ -28,6 +30,7 @@ let nextMessageId = 0;
 const emptyMessages: ChatMessage[] = [];
 const sessionRepository: SessionRepository =
   new LocalStorageSessionRepository();
+const MAX_TERMINAL_OUTPUT_LENGTH = 100_000;
 
 function createMessageId() {
   nextMessageId += 1;
@@ -44,6 +47,12 @@ function getWorkspaceName(path: string): string {
 
 function updateSessionTimestamp(session: ChatSession): ChatSession {
   return { ...session, updatedAt: new Date().toISOString() };
+}
+
+function appendTerminalOutput(current: string, chunk: string): string {
+  const output = current + chunk;
+  if (output.length <= MAX_TERMINAL_OUTPUT_LENGTH) return output;
+  return `[Earlier output omitted]\n${output.slice(-MAX_TERMINAL_OUTPUT_LENGTH)}`;
 }
 
 function App() {
@@ -66,6 +75,9 @@ function App() {
     { approval: ToolApprovalRequest; sessionId: string }[]
   >([]);
   const [resolvingApprovalId, setResolvingApprovalId] = useState<string>();
+  const [commandOutputs, setCommandOutputs] = useState<
+    Record<string, TerminalOutput>
+  >({});
   const controllersRef = useRef(new Map<string, AbortController>());
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -78,12 +90,20 @@ function App() {
     ? streamingSessionIds.has(activeSession.id)
     : false;
   const currentToolApproval = toolApprovals[0]?.approval;
+  const approvalCommand =
+    currentToolApproval?.tool.name === "run_command" &&
+    typeof currentToolApproval.arguments.command === "string"
+      ? currentToolApproval.arguments.command
+      : null;
   const inlineFileApproval =
     activeSession &&
     toolApprovals[0]?.sessionId === activeSession.id &&
     currentToolApproval?.preview
       ? currentToolApproval
       : undefined;
+  const activeCommandOutput = activeSession
+    ? (commandOutputs[activeSession.id] ?? null)
+    : null;
 
   useEffect(() => {
     try {
@@ -178,6 +198,38 @@ function App() {
     [],
   );
 
+  const updateCommandOutput = useCallback(
+    (sessionId: string, event: CommandOutputEvent) => {
+      setCommandOutputs((current) => {
+        const previous = current[sessionId];
+        const output: TerminalOutput =
+          event.phase === "started" || !previous
+            ? {
+                commandId: event.command_id,
+                command: event.command,
+                status: event.status ?? "running",
+                exitCode: event.exit_code,
+                error: event.error,
+                stdout: "",
+                stderr: "",
+              }
+            : { ...previous };
+
+        if (event.phase === "output" && event.chunk) {
+          const key = event.stream === "stderr" ? "stderr" : "stdout";
+          output[key] = appendTerminalOutput(output[key], event.chunk);
+        } else if (event.phase === "completed") {
+          output.status = event.status ?? "failed";
+          output.exitCode = event.exit_code;
+          output.error = event.error;
+        }
+
+        return { ...current, [sessionId]: output };
+      });
+    },
+    [],
+  );
+
   const generateResponse = useCallback(
     async (
       sessionId: string,
@@ -226,6 +278,7 @@ function App() {
                 ? current
                 : [...current, { approval, sessionId }],
             ),
+          (event) => updateCommandOutput(sessionId, event),
           controller.signal,
         );
       } catch (error) {
@@ -241,6 +294,20 @@ function App() {
               ),
             }),
           );
+        } else {
+          setCommandOutputs((current) => {
+            const output = current[sessionId];
+            return output?.status === "running"
+              ? {
+                  ...current,
+                  [sessionId]: {
+                    ...output,
+                    status: "cancelled",
+                    error: "Command cancelled.",
+                  },
+                }
+              : current;
+          });
         }
       } finally {
         if (controllersRef.current.get(sessionId) === controller) {
@@ -256,7 +323,7 @@ function App() {
         }
       }
     },
-    [updateSession],
+    [updateCommandOutput, updateSession],
   );
 
   const handleCreateSession = useCallback(async () => {
@@ -590,9 +657,18 @@ function App() {
                   <strong>{currentToolApproval.tool.name}</strong>
                   {`: ${currentToolApproval.tool.description}`}
                 </p>
-                <pre>
-                  {JSON.stringify(currentToolApproval.arguments, null, 2)}
-                </pre>
+                {approvalCommand !== null ? (
+                  <>
+                    <p className="tool-approval__command-label">
+                      Exact command to run:
+                    </p>
+                    <pre>{approvalCommand}</pre>
+                  </>
+                ) : (
+                  <pre>
+                    {JSON.stringify(currentToolApproval.arguments, null, 2)}
+                  </pre>
+                )}
                 <div className="tool-approval__actions">
                   <button
                     type="button"
@@ -647,6 +723,7 @@ function App() {
                 </span>
               )}
             </div>
+            <TerminalPanel output={activeCommandOutput} />
             <section className="conversation" aria-label="Conversation">
               {messages.length === 0 ? (
                 <div className="empty-state">

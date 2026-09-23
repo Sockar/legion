@@ -25,6 +25,11 @@ session's workspace and reject paths that escape it. Creates fail for existing
 files unless `overwrite` is explicitly true. Edits use an exact `old_str` to
 `new_str` replacement and reject missing or ambiguous matches. File mutations
 require approval and show a highlighted diff in the chat before writing.
+The high-risk `run_command` tool also requires confirmation and displays the
+exact command before execution. It runs in the active workspace, streams
+stdout/stderr to the terminal panel, and stops after 60 seconds by default
+(configurable up to 10 minutes). Commands are not sandboxed; broader command
+sandboxing and restrictions are tracked separately in issue #12.
 New tools implement the Rust `Tool` trait and can be registered on
 `BackendState` before it is shared.
 
