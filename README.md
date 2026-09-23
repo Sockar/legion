@@ -10,9 +10,13 @@ detects the server at `http://localhost:11434`, lists installed models, streams
 model-pull progress, and streams chat responses.
 
 Chat sessions are stored locally and restored when the app restarts. Each
-session keeps its own conversation and model selection and is associated with a
-workspace folder chosen through the native folder picker. Session persistence is
-behind a repository interface so the storage can be replaced with SQLite later.
+session keeps its own conversation, model selection, sampling parameters, and
+system prompt, and is associated with a workspace folder chosen through the
+native folder picker. The Settings panel also stores the Ollama base URL and can
+test the connection. These preferences share the session repository and persist
+across restarts; older saved sessions are restored with the default settings.
+Session persistence is behind a repository interface so the storage can be
+replaced with SQLite later.
 
 Chat requests include registered function schemas. The Rust tool registry
 dispatches Ollama tool calls, returns results (including failures) to the model,

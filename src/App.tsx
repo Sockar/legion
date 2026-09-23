@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { FileChangeReview } from "./components/FileChangeReview";
 import { ChatInput } from "./components/ChatInput";
 import { MessageList } from "./components/MessageList";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { SessionSidebar } from "./components/SessionSidebar";
 import { TerminalPanel, type TerminalOutput } from "./components/TerminalPanel";
 import {
@@ -22,7 +23,13 @@ import {
   type ToolApprovalRequest,
 } from "./lib/ollama";
 import type { ChatMessage } from "./types/chat";
-import type { ChatSession, PersistedSessionState } from "./types/session";
+import {
+  DEFAULT_CHAT_SETTINGS,
+  type ChatSession,
+  type ChatSettings,
+  type PersistedSessionState,
+} from "./types/session";
+import { DEFAULT_OLLAMA_ENDPOINT } from "./lib/sessionRepository";
 import "./App.css";
 
 let nextMessageId = 0;
@@ -59,11 +66,13 @@ function App() {
   const [sessionState, setSessionState] = useState<PersistedSessionState>({
     sessions: [],
     activeSessionId: null,
+    ollamaEndpoint: DEFAULT_OLLAMA_ENDPOINT,
   });
   const [isSessionStateLoaded, setIsSessionStateLoaded] = useState(false);
   const [storageError, setStorageError] = useState("");
   const [runtimeError, setRuntimeError] = useState("");
   const [status, setStatus] = useState<ServerStatus>();
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [pullModelName, setPullModelName] = useState("llama3.2");
   const [pullProgress, setPullProgress] = useState<PullProgress>();
@@ -147,35 +156,41 @@ function App() {
     [],
   );
 
-  const refreshStatus = useCallback(async () => {
-    try {
-      setStatus(await getOllamaStatus());
-    } catch (error) {
-      setRuntimeError(errorMessage(error));
-    }
-  }, []);
+  const refreshStatus = useCallback(
+    async (endpoint = sessionState.ollamaEndpoint) => {
+      try {
+        setStatus(await getOllamaStatus(endpoint));
+      } catch (error) {
+        setRuntimeError(errorMessage(error));
+      }
+    },
+    [sessionState.ollamaEndpoint],
+  );
 
-  const refreshModels = useCallback(async () => {
-    try {
-      const availableModels = await listOllamaModels();
-      setModels(availableModels);
-      setSessionState((current) => ({
-        ...current,
-        sessions: current.sessions.map((session) =>
-          session.model &&
-          availableModels.some((model) => model.name === session.model)
-            ? session
-            : updateSessionTimestamp({
-                ...session,
-                model: availableModels[0]?.name ?? "",
-              }),
-        ),
-      }));
-      setRuntimeError("");
-    } catch (error) {
-      setRuntimeError(errorMessage(error));
-    }
-  }, []);
+  const refreshModels = useCallback(
+    async (endpoint = sessionState.ollamaEndpoint) => {
+      try {
+        const availableModels = await listOllamaModels(endpoint);
+        setModels(availableModels);
+        setSessionState((current) => ({
+          ...current,
+          sessions: current.sessions.map((session) =>
+            session.model &&
+            availableModels.some((model) => model.name === session.model)
+              ? session
+              : updateSessionTimestamp({
+                  ...session,
+                  model: availableModels[0]?.name ?? "",
+                }),
+          ),
+        }));
+        setRuntimeError("");
+      } catch (error) {
+        setRuntimeError(errorMessage(error));
+      }
+    },
+    [sessionState.ollamaEndpoint],
+  );
 
   useEffect(() => {
     void refreshStatus();
@@ -237,6 +252,8 @@ function App() {
       history: ChatMessage[],
       model: string,
       workspacePath: string,
+      settings: ChatSettings,
+      endpoint: string,
     ) => {
       if (controllersRef.current.has(sessionId) || !model) return;
 
@@ -255,8 +272,15 @@ function App() {
       try {
         await streamOllamaChat(
           model,
-          history.map(({ role, content }) => ({ role, content })),
+          [
+            ...(settings.systemPrompt.trim()
+              ? [{ role: "system" as const, content: settings.systemPrompt }]
+              : []),
+            ...history.map(({ role, content }) => ({ role, content })),
+          ],
           workspacePath,
+          endpoint,
+          settings,
           ({ content }) => {
             updateSession(sessionId, (session) =>
               updateSessionTimestamp({
@@ -345,9 +369,11 @@ function App() {
         updatedAt: now,
         messages: [],
         model: models[0]?.name ?? "",
+        settings: DEFAULT_CHAT_SETTINGS,
         archivedAt: null,
       };
       setSessionState((current) => ({
+        ...current,
         sessions: [session, ...current.sessions],
         activeSessionId: session.id,
       }));
@@ -388,7 +414,7 @@ function App() {
           ? (sessions.find((session) => session.archivedAt === null)?.id ??
             null)
           : current.activeSessionId;
-      return { sessions, activeSessionId: nextActive };
+      return { ...current, sessions, activeSessionId: nextActive };
     });
   }, []);
 
@@ -400,6 +426,7 @@ function App() {
           : session,
       );
       return {
+        ...current,
         sessions,
         activeSessionId: current.activeSessionId ?? sessionId,
       };
@@ -429,7 +456,7 @@ function App() {
             current.activeSessionId === sessionId
               ? (sessions.find((item) => item.archivedAt === null)?.id ?? null)
               : current.activeSessionId;
-          return { sessions, activeSessionId: nextActive };
+          return { ...current, sessions, activeSessionId: nextActive };
         });
       } catch (error) {
         setRuntimeError(`Unable to delete session: ${errorMessage(error)}`);
@@ -464,9 +491,16 @@ function App() {
         history,
         activeSession.model,
         activeSession.workspacePath,
+        activeSession.settings,
+        sessionState.ollamaEndpoint,
       );
     },
-    [activeSession, generateResponse, updateSession],
+    [
+      activeSession,
+      generateResponse,
+      sessionState.ollamaEndpoint,
+      updateSession,
+    ],
   );
 
   const handleStop = useCallback(() => {
@@ -515,10 +549,12 @@ function App() {
           history,
           activeSession.model,
           activeSession.workspacePath,
+          activeSession.settings,
+          sessionState.ollamaEndpoint,
         );
       }
     },
-    [activeSession, generateResponse],
+    [activeSession, generateResponse, sessionState.ollamaEndpoint],
   );
 
   const handleModelChange = useCallback(
@@ -536,7 +572,11 @@ function App() {
     setPullProgress(undefined);
     setRuntimeError("");
     try {
-      await pullOllamaModel(pullModelName.trim(), setPullProgress);
+      await pullOllamaModel(
+        pullModelName.trim(),
+        sessionState.ollamaEndpoint,
+        setPullProgress,
+      );
       await refreshModels();
     } catch (error) {
       setRuntimeError(errorMessage(error));
@@ -544,6 +584,38 @@ function App() {
       setIsPulling(false);
     }
   };
+
+  const handleSaveSettings = useCallback(
+    (
+      sessionId: string | null,
+      model: string,
+      settings: ChatSettings,
+      endpoint: string,
+    ) => {
+      setSessionState((current) => ({
+        ...current,
+        ollamaEndpoint: endpoint,
+        sessions: current.sessions.map((session) =>
+          session.id === sessionId
+            ? updateSessionTimestamp({ ...session, model, settings })
+            : session,
+        ),
+      }));
+      void refreshStatus(endpoint);
+      void refreshModels(endpoint);
+    },
+    [refreshModels, refreshStatus],
+  );
+
+  const handleTestConnection = useCallback(
+    async (endpoint: string) => {
+      const nextStatus = await getOllamaStatus(endpoint);
+      setStatus(nextStatus);
+      if (nextStatus.connected) await refreshModels(endpoint);
+      return nextStatus;
+    },
+    [refreshModels],
+  );
 
   if (!isSessionStateLoaded) {
     return (
@@ -616,6 +688,15 @@ function App() {
           />
           {status?.message ?? "Checking Ollama…"}
         </button>
+        <button
+          aria-label="Open settings"
+          className="settings-button"
+          onClick={() => setIsSettingsOpen(true)}
+          title="Settings"
+          type="button"
+        >
+          ⚙
+        </button>
       </header>
 
       {storageError && (
@@ -627,6 +708,18 @@ function App() {
         <p className="runtime-error" role="alert">
           {runtimeError}
         </p>
+      )}
+
+      {isSettingsOpen && (
+        <SettingsPanel
+          key={activeSession?.id ?? "no-active-session"}
+          activeSession={activeSession}
+          endpoint={sessionState.ollamaEndpoint}
+          models={models}
+          onClose={() => setIsSettingsOpen(false)}
+          onSave={handleSaveSettings}
+          onTestConnection={handleTestConnection}
+        />
       )}
 
       {currentToolApproval && !inlineFileApproval && (

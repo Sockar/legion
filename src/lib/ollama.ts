@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import type { ChatSettings } from "../types/session";
 
 export interface ModelInfo {
   name: string;
@@ -89,16 +90,17 @@ export interface ChatChunk {
   done: boolean;
 }
 
-export async function getOllamaStatus(): Promise<ServerStatus> {
-  return invoke<ServerStatus>("ollama_status");
+export async function getOllamaStatus(endpoint: string): Promise<ServerStatus> {
+  return invoke<ServerStatus>("ollama_status", { endpoint });
 }
 
-export async function listOllamaModels(): Promise<ModelInfo[]> {
-  return invoke<ModelInfo[]>("ollama_list_models");
+export async function listOllamaModels(endpoint: string): Promise<ModelInfo[]> {
+  return invoke<ModelInfo[]>("ollama_list_models", { endpoint });
 }
 
 export async function pullOllamaModel(
   model: string,
+  endpoint: string,
   onProgress: (progress: PullProgress) => void,
 ): Promise<void> {
   const requestId = crypto.randomUUID();
@@ -110,7 +112,7 @@ export async function pullOllamaModel(
   );
 
   try {
-    await invoke("ollama_pull_model", { model, requestId });
+    await invoke("ollama_pull_model", { model, endpoint, requestId });
   } finally {
     unlisten();
   }
@@ -120,6 +122,8 @@ export async function streamOllamaChat(
   model: string,
   messages: ChatMessage[],
   workspacePath: string,
+  endpoint: string,
+  settings: ChatSettings,
   onChunk: (chunk: ChatChunk) => void,
   onApproval: (approval: ToolApprovalRequest) => void,
   onCommandOutput: (event: CommandOutputEvent) => void,
@@ -152,7 +156,17 @@ export async function streamOllamaChat(
     if (signal?.aborted) throw new DOMException("Chat cancelled", "AbortError");
 
     const chatRequest = invoke<void>("ollama_chat", {
-      request: { model, messages, workspace_path: workspacePath },
+      request: {
+        model,
+        messages,
+        workspace_path: workspacePath,
+        endpoint,
+        options: {
+          temperature: settings.temperature,
+          top_p: settings.topP,
+          num_ctx: settings.numCtx,
+        },
+      },
       requestId,
     });
     if (signal) {

@@ -69,9 +69,14 @@ impl BackendState {
 
 #[async_trait]
 pub trait LlmBackend: Send + Sync {
-    async fn status(&self) -> ServerStatus;
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, String>;
-    async fn pull_model(&self, model: String, on_progress: ProgressCallback) -> Result<(), String>;
+    async fn status(&self, endpoint: &str) -> ServerStatus;
+    async fn list_models(&self, endpoint: &str) -> Result<Vec<ModelInfo>, String>;
+    async fn pull_model(
+        &self,
+        model: String,
+        endpoint: &str,
+        on_progress: ProgressCallback,
+    ) -> Result<(), String>;
     async fn chat(
         &self,
         request: ChatRequest,
@@ -95,16 +100,35 @@ impl OllamaBackend {
         }
     }
 
-    fn api_url(&self, path: &str) -> String {
-        format!("{}{path}", self.endpoint)
+    fn api_url(&self, endpoint: &str, path: &str) -> Result<String, String> {
+        Ok(format!("{}{path}", normalize_endpoint(endpoint)?))
     }
 }
 
 #[async_trait]
 impl LlmBackend for OllamaBackend {
-    async fn status(&self) -> ServerStatus {
-        let endpoint = self.endpoint.clone();
-        match self.client.get(self.api_url("/api/tags")).send().await {
+    async fn status(&self, endpoint: &str) -> ServerStatus {
+        let endpoint = match normalize_endpoint(endpoint) {
+            Ok(endpoint) => endpoint,
+            Err(message) => {
+                return ServerStatus {
+                    connected: false,
+                    endpoint: endpoint.to_owned(),
+                    message,
+                };
+            }
+        };
+        let url = match self.api_url(&endpoint, "/api/tags") {
+            Ok(url) => url,
+            Err(message) => {
+                return ServerStatus {
+                    connected: false,
+                    endpoint,
+                    message,
+                };
+            }
+        };
+        match self.client.get(url).send().await {
             Ok(response) if response.status().is_success() => ServerStatus {
                 connected: true,
                 endpoint,
@@ -123,10 +147,10 @@ impl LlmBackend for OllamaBackend {
         }
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, String> {
+    async fn list_models(&self, endpoint: &str) -> Result<Vec<ModelInfo>, String> {
         let response = self
             .client
-            .get(self.api_url("/api/tags"))
+            .get(self.api_url(endpoint, "/api/tags")?)
             .send()
             .await
             .map_err(|error| format!("Could not reach Ollama: {error}"))?;
@@ -138,10 +162,15 @@ impl LlmBackend for OllamaBackend {
             .map_err(|error| format!("Could not parse Ollama model list: {error}"))
     }
 
-    async fn pull_model(&self, model: String, on_progress: ProgressCallback) -> Result<(), String> {
+    async fn pull_model(
+        &self,
+        model: String,
+        endpoint: &str,
+        on_progress: ProgressCallback,
+    ) -> Result<(), String> {
         let response = self
             .client
-            .post(self.api_url("/api/pull"))
+            .post(self.api_url(endpoint, "/api/pull")?)
             .json(&PullRequest { name: model })
             .send()
             .await
@@ -170,15 +199,22 @@ impl LlmBackend for OllamaBackend {
         request_id: String,
         on_chunk: ChatCallback,
     ) -> Result<ChatMessage, String> {
+        request.options.validate()?;
+        let endpoint = if request.endpoint.is_empty() {
+            self.endpoint.as_str()
+        } else {
+            request.endpoint.as_str()
+        };
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err("Chat cancelled".to_owned()),
             response = self
                 .client
-                .post(self.api_url("/api/chat"))
+                .post(self.api_url(endpoint, "/api/chat")?)
                 .json(&ChatApiRequest {
                     model: request.model,
                     messages: request.messages,
                     tools,
+                    options: request.options,
                     stream: true,
                 })
                 .send() => response.map_err(|error| format!("Could not reach Ollama: {error}"))?,
@@ -270,6 +306,70 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub workspace_path: Option<PathBuf>,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub options: ChatOptions,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ChatOptions {
+    #[serde(default = "default_temperature")]
+    pub temperature: f64,
+    #[serde(default = "default_top_p")]
+    pub top_p: f64,
+    #[serde(default = "default_num_ctx")]
+    pub num_ctx: u32,
+}
+
+impl Default for ChatOptions {
+    fn default() -> Self {
+        Self {
+            temperature: default_temperature(),
+            top_p: default_top_p(),
+            num_ctx: default_num_ctx(),
+        }
+    }
+}
+
+impl ChatOptions {
+    fn validate(&self) -> Result<(), String> {
+        if !self.temperature.is_finite() || !(0.0..=2.0).contains(&self.temperature) {
+            return Err("Temperature must be between 0 and 2.".to_owned());
+        }
+        if !self.top_p.is_finite() || !(0.0..=1.0).contains(&self.top_p) {
+            return Err("Top-p must be between 0 and 1.".to_owned());
+        }
+        if !(256..=131_072).contains(&self.num_ctx) {
+            return Err("Context length must be between 256 and 131072.".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn default_temperature() -> f64 {
+    0.7
+}
+
+fn default_top_p() -> f64 {
+    0.9
+}
+
+fn default_num_ctx() -> u32 {
+    4096
+}
+
+fn normalize_endpoint(endpoint: &str) -> Result<String, String> {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    let parsed =
+        reqwest::Url::parse(endpoint).map_err(|error| format!("Invalid Ollama URL: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+        return Err("Ollama URL must be an HTTP or HTTPS URL with a host.".to_owned());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("Ollama URL cannot include a query or fragment.".to_owned());
+    }
+    Ok(endpoint.to_owned())
 }
 
 #[derive(Serialize)]
@@ -282,6 +382,7 @@ struct ChatApiRequest {
     model: String,
     messages: Vec<ChatMessage>,
     tools: Vec<ToolDefinition>,
+    options: ChatOptions,
     stream: bool,
 }
 
@@ -535,15 +636,19 @@ struct ToolLoopCallbacks<'a> {
 }
 
 #[tauri::command]
-pub async fn ollama_status(backend: State<'_, BackendState>) -> Result<ServerStatus, String> {
-    Ok(backend.backend.status().await)
+pub async fn ollama_status(
+    backend: State<'_, BackendState>,
+    endpoint: String,
+) -> Result<ServerStatus, String> {
+    Ok(backend.backend.status(&endpoint).await)
 }
 
 #[tauri::command]
 pub async fn ollama_list_models(
     backend: State<'_, BackendState>,
+    endpoint: String,
 ) -> Result<Vec<ModelInfo>, String> {
-    backend.backend.list_models().await
+    backend.backend.list_models(&endpoint).await
 }
 
 #[tauri::command]
@@ -551,6 +656,7 @@ pub async fn ollama_pull_model(
     app: AppHandle,
     backend: State<'_, BackendState>,
     model: String,
+    endpoint: String,
     request_id: String,
 ) -> Result<(), String> {
     let progress_app = app.clone();
@@ -561,16 +667,25 @@ pub async fn ollama_pull_model(
             .emit(PULL_PROGRESS_EVENT, progress)
             .map_err(|error| format!("Could not emit model pull progress: {error}"))
     });
-    backend.backend.pull_model(model, on_progress).await
+    backend
+        .backend
+        .pull_model(model, &endpoint, on_progress)
+        .await
 }
 
 #[tauri::command]
 pub async fn ollama_chat(
     app: AppHandle,
     backend: State<'_, BackendState>,
-    request: ChatRequest,
+    mut request: ChatRequest,
     request_id: String,
 ) -> Result<(), String> {
+    request.options.validate()?;
+    request.endpoint = normalize_endpoint(if request.endpoint.is_empty() {
+        DEFAULT_OLLAMA_ENDPOINT
+    } else {
+        &request.endpoint
+    })?;
     let cancellation = CancellationToken::new();
     {
         let mut active_chats = backend
@@ -743,9 +858,10 @@ impl NdjsonBuffer {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_ndjson_line, run_tool_loop, ApprovalHandler, ChatApiResponse, ChatCallback,
-        ChatChunk, ChatMessage, ChatRequest, LlmBackend, ModelInfo, NdjsonBuffer, ServerStatus,
-        ToolApprovalRequest, ToolLoopCallbacks, MAX_TOOL_ITERATIONS,
+        normalize_endpoint, parse_ndjson_line, run_tool_loop, ApprovalHandler, ChatApiRequest,
+        ChatApiResponse, ChatCallback, ChatChunk, ChatMessage, ChatOptions, ChatRequest,
+        LlmBackend, ModelInfo, NdjsonBuffer, ServerStatus, ToolApprovalRequest, ToolLoopCallbacks,
+        MAX_TOOL_ITERATIONS,
     };
     use crate::tools::{
         CommandOutputCallback, RiskLevel, Tool, ToolCall, ToolContext, ToolDefinition,
@@ -763,6 +879,50 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
+    #[test]
+    fn validates_ollama_endpoint_and_sampling_options() {
+        assert_eq!(
+            normalize_endpoint(" https://ollama.example/ "),
+            Ok("https://ollama.example".to_owned())
+        );
+        assert!(normalize_endpoint("file:///tmp/ollama").is_err());
+        assert!(normalize_endpoint("http://localhost:11434/?token=x").is_err());
+
+        let options = ChatOptions::default();
+        assert!(options.validate().is_ok());
+        assert!(ChatOptions {
+            temperature: 2.1,
+            ..options.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(ChatOptions {
+            top_p: -0.1,
+            ..options
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn serializes_sampling_options_for_ollama_chat() {
+        let request = ChatApiRequest {
+            model: "test-model".to_owned(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            options: ChatOptions {
+                temperature: 0.4,
+                top_p: 0.8,
+                num_ctx: 8192,
+            },
+            stream: true,
+        };
+        let value = serde_json::to_value(request).expect("request serializes");
+        assert_eq!(value["options"]["temperature"], 0.4);
+        assert_eq!(value["options"]["top_p"], 0.8);
+        assert_eq!(value["options"]["num_ctx"], 8192);
+    }
+
     struct MockBackend {
         responses: Mutex<VecDeque<ChatMessage>>,
         requests: Mutex<Vec<ChatRequest>>,
@@ -779,7 +939,7 @@ mod tests {
 
     #[async_trait]
     impl LlmBackend for MockBackend {
-        async fn status(&self) -> ServerStatus {
+        async fn status(&self, _endpoint: &str) -> ServerStatus {
             ServerStatus {
                 connected: true,
                 endpoint: String::new(),
@@ -787,13 +947,14 @@ mod tests {
             }
         }
 
-        async fn list_models(&self) -> Result<Vec<ModelInfo>, String> {
+        async fn list_models(&self, _endpoint: &str) -> Result<Vec<ModelInfo>, String> {
             Ok(Vec::new())
         }
 
         async fn pull_model(
             &self,
             _model: String,
+            _endpoint: &str,
             _on_progress: super::ProgressCallback,
         ) -> Result<(), String> {
             Ok(())
@@ -895,6 +1056,8 @@ mod tests {
         ChatRequest {
             model: "mock".to_owned(),
             workspace_path: Some(std::path::PathBuf::from("test-workspace")),
+            endpoint: super::DEFAULT_OLLAMA_ENDPOINT.to_owned(),
+            options: super::ChatOptions::default(),
             messages: vec![ChatMessage {
                 role: "user".to_owned(),
                 content: "run it".to_owned(),
