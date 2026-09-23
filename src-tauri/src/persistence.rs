@@ -161,6 +161,8 @@ pub struct PersistedSessionState {
     pub active_session_id: Option<String>,
     #[serde(default = "default_ollama_endpoint")]
     pub ollama_endpoint: String,
+    #[serde(default = "default_auto_install_ollama")]
+    pub auto_install_ollama: bool,
     #[serde(default)]
     pub tool_audit_log: Vec<ToolAuditRecord>,
 }
@@ -171,6 +173,7 @@ impl Default for PersistedSessionState {
             sessions: Vec::new(),
             active_session_id: None,
             ollama_endpoint: default_ollama_endpoint(),
+            auto_install_ollama: default_auto_install_ollama(),
             tool_audit_log: Vec::new(),
         }
     }
@@ -245,6 +248,23 @@ impl Database {
             .optional()
             .map_err(storage_error)?
             .unwrap_or_else(default_ollama_endpoint);
+        let auto_install_ollama = self
+            .connection
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = 'auto_install_ollama'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .map_or_else(
+                || Ok(default_auto_install_ollama()),
+                |value| {
+                    value.parse::<bool>().map_err(|error| {
+                        format!("SQLite persistence error: invalid auto-install setting: {error}")
+                    })
+                },
+            )?;
         let active_session_id = self
             .connection
             .query_row(
@@ -399,6 +419,7 @@ impl Database {
             sessions,
             active_session_id,
             ollama_endpoint: endpoint,
+            auto_install_ollama,
             tool_audit_log,
         })
     }
@@ -516,6 +537,12 @@ fn write_state(transaction: &Transaction<'_>, state: &PersistedSessionState) -> 
             [&state.ollama_endpoint],
         )
         .map_err(storage_error)?;
+    transaction
+        .execute(
+            "INSERT INTO app_settings (key, value) VALUES ('auto_install_ollama', ?1)",
+            [state.auto_install_ollama.to_string()],
+        )
+        .map_err(storage_error)?;
     if let Some(active_session_id) = &state.active_session_id {
         transaction
             .execute(
@@ -610,6 +637,10 @@ fn default_ollama_endpoint() -> String {
     "http://localhost:11434".to_owned()
 }
 
+fn default_auto_install_ollama() -> bool {
+    true
+}
+
 #[tauri::command]
 pub fn load_session_state(
     legacy_json: Option<String>,
@@ -687,6 +718,7 @@ mod tests {
             }],
             active_session_id: Some("session-1".to_owned()),
             ollama_endpoint: "http://localhost:11434".to_owned(),
+            auto_install_ollama: false,
             tool_audit_log: Vec::new(),
         }
     }
@@ -801,6 +833,7 @@ mod tests {
         assert!(!session.messages[0].created_at.is_empty());
         assert_eq!(session.tool_call_history, Vec::new());
         assert!(!session.settings.strict_mode);
+        assert!(imported.auto_install_ollama);
     }
 
     #[test]

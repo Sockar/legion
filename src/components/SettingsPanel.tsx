@@ -14,6 +14,7 @@ import type { ModelInfo, ServerStatus } from "../lib/ollama";
 interface SettingsPanelProps {
   activeSession: ChatSession | null;
   endpoint: string;
+  autoInstallOllama: boolean;
   toolAuditLog: ToolAuditRecord[];
   models: ModelInfo[];
   onClose: () => void;
@@ -22,24 +23,36 @@ interface SettingsPanelProps {
     model: string,
     settings: ChatSettings,
     endpoint: string,
+    autoInstallOllama: boolean,
   ) => void;
   onTestConnection: (endpoint: string) => Promise<ServerStatus>;
+  onAutoInstallOllamaChange: (enabled: boolean) => void;
+  onInstallOllama: (endpoint: string) => Promise<void>;
+  isInstallingOllama: boolean;
+  installFeedback: string;
 }
 
 export function SettingsPanel({
   activeSession,
   endpoint,
+  autoInstallOllama,
   toolAuditLog,
   models,
   onClose,
   onSave,
   onTestConnection,
+  onAutoInstallOllamaChange,
+  onInstallOllama,
+  isInstallingOllama,
+  installFeedback,
 }: SettingsPanelProps) {
   const [model, setModel] = useState(activeSession?.model ?? "");
   const [settings, setSettings] = useState<ChatSettings>(
     activeSession?.settings ?? DEFAULT_CHAT_SETTINGS,
   );
   const [endpointDraft, setEndpointDraft] = useState(endpoint);
+  const [autoInstallEnabled, setAutoInstallEnabled] =
+    useState(autoInstallOllama);
   const [testStatus, setTestStatus] = useState<ServerStatus>();
   const [testError, setTestError] = useState("");
   const [isTesting, setIsTesting] = useState(false);
@@ -100,9 +113,26 @@ export function SettingsPanel({
     setTestError("");
     setTestStatus(undefined);
     try {
-      setTestStatus(await onTestConnection(endpointDraft.trim()));
+      const result = await onTestConnection(endpointDraft.trim());
+      setTestStatus(result);
+      if (!result.connected && autoInstallEnabled) {
+        await onInstallOllama(endpointDraft.trim());
+        setTestStatus(await onTestConnection(endpointDraft.trim()));
+      }
     } catch (error) {
       setTestError(error instanceof Error ? error.message : String(error));
+      if (autoInstallEnabled) {
+        await onInstallOllama(endpointDraft.trim());
+        try {
+          setTestStatus(await onTestConnection(endpointDraft.trim()));
+        } catch (retryError) {
+          setTestError(
+            retryError instanceof Error
+              ? retryError.message
+              : String(retryError),
+          );
+        }
+      }
     } finally {
       setIsTesting(false);
     }
@@ -131,7 +161,13 @@ export function SettingsPanel({
       return;
     }
     setValidationError("");
-    onSave(activeSession?.id ?? null, model, settings, endpointDraft.trim());
+    onSave(
+      activeSession?.id ?? null,
+      model,
+      settings,
+      endpointDraft.trim(),
+      autoInstallEnabled,
+    );
     onClose();
   };
 
@@ -325,6 +361,34 @@ export function SettingsPanel({
                   </span>
                 )}
               </div>
+              <label className="settings-panel__toggle">
+                <input
+                  checked={autoInstallEnabled}
+                  onChange={(event) => {
+                    setAutoInstallEnabled(event.target.checked);
+                    onAutoInstallOllamaChange(event.target.checked);
+                  }}
+                  type="checkbox"
+                />
+                <span>
+                  Ask to download and install Ollama when it is unavailable.
+                </span>
+              </label>
+              {isInstallingOllama && (
+                <p role="status">Downloading and installing Ollama…</p>
+              )}
+              {installFeedback && (
+                <p
+                  className={
+                    testStatus?.connected
+                      ? "settings-panel__connected"
+                      : "settings-panel__error"
+                  }
+                  role="status"
+                >
+                  {installFeedback}
+                </p>
+              )}
             </fieldset>
 
             <fieldset>

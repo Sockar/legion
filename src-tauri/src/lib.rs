@@ -1,4 +1,5 @@
 pub mod ollama;
+pub mod ollama_installer;
 pub mod persistence;
 pub mod search;
 pub mod security;
@@ -11,6 +12,7 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(ollama::BackendState::default())
@@ -24,6 +26,7 @@ pub fn run() {
             persistence::load_session_state,
             persistence::save_session_state,
             ollama::ollama_status,
+            ollama_installer::install_ollama,
             ollama::ollama_list_models,
             ollama::ollama_pull_model,
             ollama::ollama_chat,
