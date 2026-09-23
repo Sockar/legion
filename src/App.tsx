@@ -1,4 +1,5 @@
 import { confirm, open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FileChangeReview } from "./components/FileChangeReview";
 import { ChatInput } from "./components/ChatInput";
@@ -12,6 +13,7 @@ import {
 } from "./lib/sessionRepository";
 import {
   getOllamaStatus,
+  installOllama,
   listOllamaModels,
   pullOllamaModel,
   streamOllamaChat,
@@ -47,6 +49,17 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function comparableEndpoint(endpoint: string): string {
+  const trimmed = endpoint.trim();
+  try {
+    const parsed = new URL(trimmed);
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return trimmed.replace(/\/+$/, "");
+  }
+}
+
 function getWorkspaceName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
 }
@@ -66,11 +79,14 @@ function App() {
     sessions: [],
     activeSessionId: null,
     ollamaEndpoint: DEFAULT_OLLAMA_ENDPOINT,
+    autoInstallOllama: true,
     toolAuditLog: [],
   });
   const [isSessionStateLoaded, setIsSessionStateLoaded] = useState(false);
   const [storageError, setStorageError] = useState("");
   const [runtimeError, setRuntimeError] = useState("");
+  const [ollamaInstallFeedback, setOllamaInstallFeedback] = useState("");
+  const [isInstallingOllama, setIsInstallingOllama] = useState(false);
   const [status, setStatus] = useState<ServerStatus>();
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -88,6 +104,8 @@ function App() {
     Record<string, TerminalOutput>
   >({});
   const controllersRef = useRef(new Map<string, AbortController>());
+  const startupInstallPromptShownRef = useRef(false);
+  const installPromptInFlightRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const activeSession =
@@ -161,8 +179,18 @@ function App() {
   const refreshStatus = useCallback(
     async (endpoint = sessionState.ollamaEndpoint) => {
       try {
-        setStatus(await getOllamaStatus(endpoint));
+        const nextStatus = await getOllamaStatus(endpoint);
+        setStatus(nextStatus);
+        if (nextStatus.connected) {
+          setRuntimeError("");
+          setOllamaInstallFeedback("");
+        }
       } catch (error) {
+        setStatus({
+          connected: false,
+          endpoint,
+          message: `Ollama is unreachable: ${errorMessage(error)}`,
+        });
         setRuntimeError(errorMessage(error));
       }
     },
@@ -635,10 +663,12 @@ function App() {
       model: string,
       settings: ChatSettings,
       endpoint: string,
+      autoInstallOllama: boolean,
     ) => {
       setSessionState((current) => ({
         ...current,
         ollamaEndpoint: endpoint,
+        autoInstallOllama,
         sessions: current.sessions.map((session) =>
           session.id === sessionId
             ? updateSessionTimestamp({ ...session, model, settings })
@@ -660,6 +690,99 @@ function App() {
     },
     [refreshModels],
   );
+
+  const handleInstallOllama = useCallback(
+    async (endpoint = sessionState.ollamaEndpoint) => {
+      if (installPromptInFlightRef.current) return;
+      installPromptInFlightRef.current = true;
+      try {
+        const shouldInstall = await confirm(
+          [
+            `Ollama could not be reached at ${endpoint}.`,
+            "",
+            "Legion can download and install Ollama from the official Ollama GitHub releases (https://github.com/ollama/ollama/releases; also available at https://ollama.com/download). The download is approximately 200 MB on macOS and 1.5 GB on Windows or Linux; the exact size varies by release. Language models are not included and require additional downloads.",
+            "",
+            "Windows opens the official installer for you to complete. macOS installs Ollama.app in your user Applications folder. Linux installs the official release archive into Legion's app data and does not request administrator access.",
+            "",
+            "Continue only if you consent to downloading and installing this software.",
+          ].join("\n"),
+          { title: "Download and install Ollama?", kind: "warning" },
+        );
+        if (!shouldInstall) {
+          setOllamaInstallFeedback("Ollama installation was cancelled.");
+          return;
+        }
+
+        setIsInstallingOllama(true);
+        setRuntimeError("");
+        setOllamaInstallFeedback("Downloading and installing Ollama…");
+        try {
+          const installMessage = await installOllama();
+          setOllamaInstallFeedback(
+            `${installMessage} Checking the connection…`,
+          );
+
+          let nextStatus: ServerStatus | undefined;
+          for (let attempt = 0; attempt < 30; attempt += 1) {
+            nextStatus = await getOllamaStatus(endpoint);
+            setStatus(nextStatus);
+            if (nextStatus.connected) break;
+            await new Promise((resolve) => window.setTimeout(resolve, 1000));
+          }
+          if (nextStatus?.connected) {
+            setOllamaInstallFeedback(
+              `${installMessage} Connected to Ollama successfully.`,
+            );
+            setRuntimeError("");
+            await refreshModels(endpoint);
+          } else {
+            throw new Error(
+              `Ollama was installed, but the configured endpoint could not be reached. ${nextStatus?.message ?? ""}`.trim(),
+            );
+          }
+        } catch (error) {
+          const message = `Could not install or start Ollama: ${errorMessage(error)}`;
+          setOllamaInstallFeedback(message);
+          setRuntimeError(message);
+        } finally {
+          setIsInstallingOllama(false);
+        }
+      } catch (error) {
+        const message = `Could not confirm Ollama installation: ${errorMessage(error)}`;
+        setOllamaInstallFeedback(message);
+        setRuntimeError(message);
+      } finally {
+        installPromptInFlightRef.current = false;
+      }
+    },
+    [refreshModels, sessionState.ollamaEndpoint],
+  );
+
+  const handleAutoInstallOllamaChange = useCallback((enabled: boolean) => {
+    setSessionState((current) => ({ ...current, autoInstallOllama: enabled }));
+  }, []);
+
+  useEffect(() => {
+    if (
+      !isSessionStateLoaded ||
+      !sessionState.autoInstallOllama ||
+      status?.connected !== false ||
+      comparableEndpoint(status.endpoint) !==
+        comparableEndpoint(sessionState.ollamaEndpoint) ||
+      startupInstallPromptShownRef.current
+    ) {
+      return;
+    }
+    startupInstallPromptShownRef.current = true;
+    void handleInstallOllama();
+  }, [
+    handleInstallOllama,
+    isSessionStateLoaded,
+    sessionState.autoInstallOllama,
+    sessionState.ollamaEndpoint,
+    status?.endpoint,
+    status?.connected,
+  ]);
 
   if (!isSessionStateLoaded) {
     return (
@@ -748,10 +871,29 @@ function App() {
           {storageError}
         </p>
       )}
-      {runtimeError && (
+      {runtimeError && runtimeError !== ollamaInstallFeedback && (
         <p className="runtime-error" role="alert">
           {runtimeError}
         </p>
+      )}
+      {ollamaInstallFeedback && (
+        <div className="runtime-error" role="status">
+          <p>{ollamaInstallFeedback}</p>
+          {!status?.connected && (
+            <button
+              type="button"
+              onClick={() =>
+                void openUrl("https://ollama.com/download").catch((error) =>
+                  setRuntimeError(
+                    `Could not open Ollama's download page: ${errorMessage(error)}`,
+                  ),
+                )
+              }
+            >
+              Open Ollama download page
+            </button>
+          )}
+        </div>
       )}
 
       {isSettingsOpen && (
@@ -759,11 +901,16 @@ function App() {
           key={activeSession?.id ?? "no-active-session"}
           activeSession={activeSession}
           endpoint={sessionState.ollamaEndpoint}
+          autoInstallOllama={sessionState.autoInstallOllama}
           toolAuditLog={sessionState.toolAuditLog}
           models={models}
           onClose={() => setIsSettingsOpen(false)}
           onSave={handleSaveSettings}
           onTestConnection={handleTestConnection}
+          onAutoInstallOllamaChange={handleAutoInstallOllamaChange}
+          onInstallOllama={handleInstallOllama}
+          isInstallingOllama={isInstallingOllama}
+          installFeedback={ollamaInstallFeedback}
         />
       )}
 

@@ -78,8 +78,31 @@ npm ci
 npm run tauri dev
 ```
 
-Ollama is only required at runtime. If it is not installed or running, the app
-builds normally and the status panel reports that it is unreachable.
+Ollama is only required at runtime. If it is not installed or running, Legion
+reports that it is unreachable and, by default, asks before downloading and
+installing the official Ollama release. Turn off **Ask to download and install
+Ollama when it is unavailable** in Settings to disable these prompts.
+
+### Ollama installation
+
+The installer uses the latest assets published by
+[Ollama on GitHub](https://github.com/ollama/ollama/releases): `OllamaSetup.exe`
+on 64-bit Windows, `Ollama-darwin.zip` on macOS, and the official
+`ollama-linux-{amd64,arm64}.tar.zst` archive on Linux. Downloads are made over
+HTTPS, checked for an expected content type and size, and verified against the
+SHA-256 digest in the official GitHub release API when it is published. If a
+release does not provide a digest, Legion reports that verification was limited
+to HTTPS and content-type/size checks. Installer sizes vary by release (roughly
+200 MB on macOS and 1.5 GB on Windows or Linux); language models are separate
+downloads.
+
+Windows setup opens interactively because Ollama does not document a reliable
+silent-install option. On macOS, the verified app bundle is installed in the
+user's `Applications` folder. On Linux, Legion installs the verified official
+archive under its app-data directory and starts its `ollama serve` process; it
+does not invoke `sudo` or install a system service. This user-scoped Linux
+approach avoids an implicit privilege escalation. If the install or server
+startup fails, the app reports the error and offers the manual download page.
 
 Check the frontend and Rust code with:
 

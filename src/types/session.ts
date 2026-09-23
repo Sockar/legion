@@ -52,5 +52,6 @@ export interface PersistedSessionState {
   sessions: ChatSession[];
   activeSessionId: string | null;
   ollamaEndpoint: string;
+  autoInstallOllama: boolean;
   toolAuditLog: ToolAuditRecord[];
 }

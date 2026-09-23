@@ -106,6 +106,10 @@ export async function getOllamaStatus(endpoint: string): Promise<ServerStatus> {
   return invoke<ServerStatus>("ollama_status", { endpoint });
 }
 
+export async function installOllama(): Promise<string> {
+  return invoke<string>("install_ollama");
+}
+
 export async function listOllamaModels(endpoint: string): Promise<ModelInfo[]> {
   return invoke<ModelInfo[]>("ollama_list_models", { endpoint });
 }
