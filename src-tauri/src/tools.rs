@@ -886,11 +886,10 @@ mod tests {
         assert!(registry.register(Arc::new(TestTool("custom"))).is_ok());
         assert!(registry.register(Arc::new(TestTool("custom"))).is_err());
         assert_eq!(registry.schemas().len(), 7);
-        let command = registry.get("run_command").expect("command tool registered");
-        assert_eq!(
-            command.schema().risk_level,
-            RiskLevel::RequiresConfirmation
-        );
+        let command = registry
+            .get("run_command")
+            .expect("command tool registered");
+        assert_eq!(command.schema().risk_level, RiskLevel::RequiresConfirmation);
     }
 
     fn temporary_workspace() -> PathBuf {
@@ -1036,10 +1035,8 @@ mod tests {
         )
         .await
         .expect("command runner enforces timeout");
-        assert!(
-            result
-                .expect_err("command times out")
-                .contains("timed out after 100 ms")
-        );
+        assert!(result
+            .expect_err("command times out")
+            .contains("timed out after 100 ms"));
     }
 }
