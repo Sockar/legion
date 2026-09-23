@@ -467,7 +467,7 @@ async fn replace_directory(staged: &Path, installed: &Path, backup: &Path) -> Re
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 async fn run_command(command: &mut Command, action: &str) -> Result<(), String> {
     let status = command
         .status()
