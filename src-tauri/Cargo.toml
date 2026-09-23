@@ -20,6 +20,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-process = "2"
+tauri-plugin-updater = { version = "2", features = ["rustls-tls"] }
 async-trait = "0.1"
 futures-util = "0.3"
 globset = "0.4"
