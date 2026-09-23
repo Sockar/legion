@@ -5,8 +5,9 @@ to work with local and open-source language models, including models served by
 [Ollama](https://ollama.com/).
 
 The app includes a chat interface with streaming Markdown responses and code
-copying. The chat currently uses an in-memory mock backend; model management and
-the production assistant integration are still under development.
+copying, powered by the local [Ollama](https://ollama.com/) HTTP API. The app
+detects the server at `http://localhost:11434`, lists installed models, streams
+model-pull progress, and streams chat responses.
 
 ## Development
 
@@ -22,6 +23,9 @@ the production assistant integration are still under development.
 npm ci
 npm run tauri dev
 ```
+
+Ollama is only required at runtime. If it is not installed or running, the app
+builds normally and the status panel reports that it is unreachable.
 
 Check the frontend and Rust code with:
 
