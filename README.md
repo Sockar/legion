@@ -4,8 +4,9 @@ Legion is a desktop coding assistant inspired by GitHub Copilot. It is being bui
 to work with local and open-source language models, including models served by
 [Ollama](https://ollama.com/).
 
-This repository currently contains the cross-platform desktop app scaffold. Chat,
-model management, and coding-assistant features will be added separately.
+The app includes a chat interface with streaming Markdown responses and code
+copying. The chat currently uses an in-memory mock backend; model management and
+the production assistant integration are still under development.
 
 ## Development
 
