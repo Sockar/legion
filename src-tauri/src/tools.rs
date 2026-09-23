@@ -533,12 +533,18 @@ mod tests {
         let workspace = root.join("workspace");
         fs::create_dir(&workspace).expect("workspace is created");
         fs::write(root.join("outside.txt"), "outside").expect("outside file is written");
-        assert!(resolve_workspace_path(&workspace, "..\\outside.txt", true)
-            .unwrap_err()
-            .contains("escapes"));
-        assert!(resolve_workspace_path(&workspace, "../new.txt", false)
-            .unwrap_err()
-            .contains("escapes"));
+        let outside_file = PathBuf::from("..").join("outside.txt");
+        let outside_new_file = PathBuf::from("..").join("new.txt");
+        assert!(
+            resolve_workspace_path(&workspace, &outside_file.to_string_lossy(), true)
+                .unwrap_err()
+                .contains("escapes")
+        );
+        assert!(
+            resolve_workspace_path(&workspace, &outside_new_file.to_string_lossy(), false)
+                .unwrap_err()
+                .contains("escapes")
+        );
         fs::remove_dir_all(root).expect("temporary workspace is removed");
     }
 
