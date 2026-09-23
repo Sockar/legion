@@ -586,6 +586,82 @@ button:disabled {
   color: #1a1b24;
 }
 
+.tool-approval__actions button:disabled,
+.file-change-review__actions button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.file-change-review {
+  overflow: hidden;
+  margin: 18px 0 28px;
+  border: 1px solid #454650;
+  border-radius: 10px;
+  background: #15161a;
+}
+
+.file-change-review__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border-bottom: 1px solid #34353d;
+  padding: 12px 14px;
+}
+
+.file-change-review__heading > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.file-change-review__heading strong {
+  overflow-wrap: anywhere;
+  color: #f1f1f3;
+  font-size: 0.83rem;
+}
+
+.file-change-review__heading span {
+  color: #999aa3;
+  font-size: 0.72rem;
+}
+
+.file-change-review__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 7px;
+}
+
+.file-change-review__actions button {
+  border: 1px solid #454650;
+  border-radius: 7px;
+  padding: 7px 10px;
+  background: #202127;
+  color: #e5e5e9;
+  font-size: 0.74rem;
+}
+
+.file-change-review__actions .file-change-review__accept {
+  border-color: #a5aaff;
+  background: #c4c8ff;
+  color: #1a1b24;
+}
+
+.file-change-review__diff {
+  max-height: 420px;
+  overflow: auto;
+  margin: 0;
+  padding: 12px 14px;
+  background: #121317;
+  font-size: 0.76rem;
+  line-height: 1.55;
+  tab-size: 2;
+}
+
+.file-change-review__diff code {
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
 @media (max-width: 900px) {
   .chat-header {
     flex-wrap: wrap;
@@ -830,6 +906,11 @@ button:disabled {
 }
 
 @media (max-width: 700px) {
+  .file-change-review__heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
   .session-sidebar {
     width: 174px;
     flex-basis: 174px;

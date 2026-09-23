@@ -19,8 +19,13 @@ dispatches Ollama tool calls, returns results (including failures) to the model,
 and continues for up to eight tool iterations. Tools declare `auto_approve` or
 `requires_confirmation`; the latter prompts the user in the app before running.
 The initial read-only examples are `get_current_time` and
-`list_workspace_files`; the listing tool receives the active session's workspace
-context. New tools implement the Rust `Tool` trait and can be registered on
+`list_workspace_files`; workspace-scoped `read_file`, `create_file`, and
+`edit_file` tools are also available. File tools resolve paths under the active
+session's workspace and reject paths that escape it. Creates fail for existing
+files unless `overwrite` is explicitly true. Edits use an exact `old_str` to
+`new_str` replacement and reject missing or ambiguous matches. File mutations
+require approval and show a highlighted diff in the chat before writing.
+New tools implement the Rust `Tool` trait and can be registered on
 `BackendState` before it is shared.
 
 ## Development

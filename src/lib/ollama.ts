@@ -49,6 +49,12 @@ export interface ToolApprovalRequest {
   approval_id: string;
   tool: ToolSchema;
   arguments: Record<string, unknown>;
+  preview?: {
+    operation: "create" | "edit";
+    path: string;
+    before: string;
+    after: string;
+  } | null;
 }
 
 export interface ServerStatus {
