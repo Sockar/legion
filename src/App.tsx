@@ -12,9 +12,11 @@ import {
   listOllamaModels,
   pullOllamaModel,
   streamOllamaChat,
+  respondToToolApproval,
   type ModelInfo,
   type PullProgress,
   type ServerStatus,
+  type ToolApprovalRequest,
 } from "./lib/ollama";
 import type { ChatMessage } from "./types/chat";
 import type { ChatSession, PersistedSessionState } from "./types/session";
@@ -59,6 +61,9 @@ function App() {
   const [streamingSessionIds, setStreamingSessionIds] = useState<Set<string>>(
     () => new Set(),
   );
+  const [toolApprovals, setToolApprovals] = useState<
+    { approval: ToolApprovalRequest; sessionId: string }[]
+  >([]);
   const controllersRef = useRef(new Map<string, AbortController>());
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -70,6 +75,7 @@ function App() {
   const isStreaming = activeSession
     ? streamingSessionIds.has(activeSession.id)
     : false;
+  const currentToolApproval = toolApprovals[0]?.approval;
 
   useEffect(() => {
     try {
@@ -170,6 +176,7 @@ function App() {
       assistantId: string,
       history: ChatMessage[],
       model: string,
+      workspacePath: string,
     ) => {
       if (controllersRef.current.has(sessionId) || !model) return;
 
@@ -189,6 +196,7 @@ function App() {
         await streamOllamaChat(
           model,
           history.map(({ role, content }) => ({ role, content })),
+          workspacePath,
           ({ content }) => {
             updateSession(sessionId, (session) =>
               updateSessionTimestamp({
@@ -201,6 +209,15 @@ function App() {
               }),
             );
           },
+          (approval) =>
+            setToolApprovals((current) =>
+              current.some(
+                (pending) =>
+                  pending.approval.approval_id === approval.approval_id,
+              )
+                ? current
+                : [...current, { approval, sessionId }],
+            ),
           controller.signal,
         );
       } catch (error) {
@@ -225,6 +242,9 @@ function App() {
             next.delete(sessionId);
             return next;
           });
+          setToolApprovals((current) =>
+            current.filter((pending) => pending.sessionId !== sessionId),
+          );
         }
       }
     },
@@ -368,6 +388,7 @@ function App() {
         assistantId,
         history,
         activeSession.model,
+        activeSession.workspacePath,
       );
     },
     [activeSession, generateResponse, updateSession],
@@ -378,6 +399,24 @@ function App() {
       controllersRef.current.get(activeSession.id)?.abort();
     }
   }, [activeSession]);
+
+  const handleToolApproval = useCallback(
+    async (approved: boolean) => {
+      if (!currentToolApproval) return;
+      try {
+        await respondToToolApproval(currentToolApproval.approval_id, approved);
+        setToolApprovals((current) =>
+          current.filter(
+            (pending) =>
+              pending.approval.approval_id !== currentToolApproval.approval_id,
+          ),
+        );
+      } catch (error) {
+        setRuntimeError(errorMessage(error));
+      }
+    },
+    [currentToolApproval],
+  );
 
   const handleRegenerate = useCallback(
     (assistantId: string) => {
@@ -397,6 +436,7 @@ function App() {
           assistantId,
           history,
           activeSession.model,
+          activeSession.workspacePath,
         );
       }
     },
@@ -509,6 +549,39 @@ function App() {
         <p className="runtime-error" role="alert">
           {runtimeError}
         </p>
+      )}
+
+      {currentToolApproval && (
+        <div className="tool-approval-backdrop">
+          <section
+            className="tool-approval"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="tool-approval-title"
+          >
+            <h2 id="tool-approval-title">Allow tool execution?</h2>
+            <p>
+              <strong>{currentToolApproval.tool.name}</strong>
+              {`: ${currentToolApproval.tool.description}`}
+            </p>
+            <pre>{JSON.stringify(currentToolApproval.arguments, null, 2)}</pre>
+            <div className="tool-approval__actions">
+              <button
+                type="button"
+                onClick={() => void handleToolApproval(false)}
+              >
+                Deny
+              </button>
+              <button
+                className="tool-approval__allow"
+                type="button"
+                onClick={() => void handleToolApproval(true)}
+              >
+                Allow once
+              </button>
+            </div>
+          </section>
+        </div>
       )}
 
       <div className="chat-body">

@@ -1,4 +1,5 @@
 pub mod ollama;
+pub mod tools;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -11,6 +12,7 @@ pub fn run() {
             ollama::ollama_pull_model,
             ollama::ollama_chat,
             ollama::ollama_cancel_chat,
+            ollama::respond_tool_approval,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
