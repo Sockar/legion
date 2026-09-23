@@ -16,6 +16,8 @@ use tokio::{
     time::{timeout, Duration},
 };
 
+use crate::search::{GlobSearch, GrepSearch, IndexWorkspace, SemanticSearch};
+
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 60_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 600_000;
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 64 * 1024;
@@ -140,6 +142,18 @@ impl ToolRegistry {
         registry
             .register(Arc::new(RunCommand))
             .expect("the built-in command tool has a valid name");
+        registry
+            .register(Arc::new(GrepSearch))
+            .expect("the built-in grep search tool has a valid name");
+        registry
+            .register(Arc::new(GlobSearch))
+            .expect("the built-in glob search tool has a valid name");
+        registry
+            .register(Arc::new(IndexWorkspace))
+            .expect("the built-in indexing tool has a valid name");
+        registry
+            .register(Arc::new(SemanticSearch))
+            .expect("the built-in semantic search tool has a valid name");
         registry
     }
 
@@ -885,7 +899,7 @@ mod tests {
         let mut registry = ToolRegistry::with_examples();
         assert!(registry.register(Arc::new(TestTool("custom"))).is_ok());
         assert!(registry.register(Arc::new(TestTool("custom"))).is_err());
-        assert_eq!(registry.schemas().len(), 7);
+        assert_eq!(registry.schemas().len(), 11);
         let command = registry
             .get("run_command")
             .expect("command tool registered");

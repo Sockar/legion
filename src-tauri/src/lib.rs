@@ -1,4 +1,5 @@
 pub mod ollama;
+pub mod search;
 pub mod tools;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

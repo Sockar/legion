@@ -33,6 +33,19 @@ sandboxing and restrictions are tracked separately in issue #12.
 New tools implement the Rust `Tool` trait and can be registered on
 `BackendState` before it is shared.
 
+The agent also has read-only `grep_search` (literal or regular-expression
+matching with bounded context), `glob_search`, and `semantic_search` tools. To
+build or refresh the local semantic index, the agent can call
+`index_workspace` on demand. The index is stored under `.legion/` in the active
+workspace. Semantic search uses Ollama's `/api/embed` endpoint and defaults to
+`nomic-embed-text`; set `LEGION_EMBEDDING_MODEL` to choose another embedding
+model, or pass a `model` argument to either semantic tool. Set `OLLAMA_HOST` to
+change the Ollama endpoint. If Ollama or the embedding model is unavailable,
+indexing and semantic search return a status message without interrupting chat.
+Search skips hidden/generated directories such as `.git`, `node_modules`,
+`target`, and `.legion`, and all discovered files are checked against the
+workspace boundary.
+
 ## Development
 
 ### Prerequisites
