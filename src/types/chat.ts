@@ -4,4 +4,6 @@ export interface ChatMessage {
   id: string;
   role: ChatRole;
   content: string;
+  createdAt?: string;
+  toolCallData?: unknown;
 }

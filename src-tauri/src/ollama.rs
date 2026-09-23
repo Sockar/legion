@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -21,11 +22,24 @@ use crate::tools::{
 const DEFAULT_OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 const PULL_PROGRESS_EVENT: &str = "ollama://pull-progress";
 const CHAT_CHUNK_EVENT: &str = "ollama://chat-chunk";
+const TOOL_CALL_EVENT: &str = "tools://tool-call";
 const TOOL_APPROVAL_EVENT: &str = "tools://approval-request";
 const MAX_TOOL_ITERATIONS: usize = 8;
 
 pub type ProgressCallback = Arc<dyn Fn(PullProgress) -> Result<(), String> + Send + Sync>;
 pub type ChatCallback = Arc<dyn Fn(ChatChunk) -> Result<(), String> + Send + Sync>;
+pub type ToolCallCallback = Arc<dyn Fn(ToolCallEvent) -> Result<(), String> + Send + Sync>;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ToolCallEvent {
+    pub id: String,
+    pub request_id: String,
+    pub tool_name: String,
+    pub arguments: Value,
+    pub result: Value,
+    pub status: String,
+    pub created_at: String,
+}
 
 #[derive(Clone)]
 pub struct BackendState {
@@ -543,6 +557,7 @@ async fn run_tool_loop(
             if cancellation.is_cancelled() {
                 return Ok(());
             }
+            let call_arguments = call.function.arguments.clone();
             let result = if let Some(tool) = tools.get(&call.function.name) {
                 let schema = tool.schema();
                 let context = ToolContext {
@@ -558,8 +573,18 @@ async fn run_tool_loop(
                     } {
                         Ok(preview) => preview,
                         Err(error) => {
-                            let content = serde_json::to_string(&json!({ "error": error }))
-                                .map_err(|encode_error| {
+                            let result = json!({ "error": error });
+                            (callbacks.on_tool_call)(ToolCallEvent {
+                                id: format!("{request_id}-{iteration}-{call_index}"),
+                                request_id: request_id.to_owned(),
+                                tool_name: call.function.name.clone(),
+                                arguments: call.function.arguments.clone(),
+                                result: result.clone(),
+                                status: "failed".to_owned(),
+                                created_at: unix_timestamp(),
+                            })?;
+                            let content =
+                                serde_json::to_string(&result).map_err(|encode_error| {
                                     format!("Could not encode tool result: {encode_error}")
                                 })?;
                             request.messages.push(ChatMessage {
@@ -594,7 +619,7 @@ async fn run_tool_loop(
                 if !approved {
                     json!({ "error": "User denied permission to run this tool." })
                 } else {
-                    let mut approved_arguments = call.function.arguments;
+                    let mut approved_arguments = call_arguments.clone();
                     if let Some(before) = preview.as_ref().and_then(|preview| preview.get("before"))
                     {
                         if let Some(arguments) = approved_arguments.as_object_mut() {
@@ -615,6 +640,19 @@ async fn run_tool_loop(
                 json!({ "error": format!("Tool '{}' is not registered.", call.function.name) })
             };
 
+            (callbacks.on_tool_call)(ToolCallEvent {
+                id: format!("{request_id}-{iteration}-{call_index}"),
+                request_id: request_id.to_owned(),
+                tool_name: call.function.name.clone(),
+                arguments: call_arguments,
+                status: if result.get("error").is_some() {
+                    "failed".to_owned()
+                } else {
+                    "succeeded".to_owned()
+                },
+                result: result.clone(),
+                created_at: unix_timestamp(),
+            })?;
             let content = serde_json::to_string(&result)
                 .map_err(|error| format!("Could not encode tool result: {error}"))?;
             request.messages.push(ChatMessage {
@@ -633,6 +671,14 @@ struct ToolLoopCallbacks<'a> {
     approval_handler: &'a dyn ApprovalHandler,
     command_output: CommandOutputCallback,
     on_chunk: &'a ChatCallback,
+    on_tool_call: &'a ToolCallCallback,
+}
+
+fn unix_timestamp() -> String {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
+        |_| "0".to_owned(),
+        |duration| duration.as_millis().to_string(),
+    )
 }
 
 #[tauri::command]
@@ -715,6 +761,12 @@ pub async fn ollama_chat(
             .emit(COMMAND_OUTPUT_EVENT, event)
             .map_err(|error| format!("Could not emit command output: {error}"))
     });
+    let tool_call_app = app.clone();
+    let on_tool_call: ToolCallCallback = Arc::new(move |event| {
+        tool_call_app
+            .emit(TOOL_CALL_EVENT, event)
+            .map_err(|error| format!("Could not emit tool call history: {error}"))
+    });
     let result = run_tool_loop(
         backend.backend.as_ref(),
         &backend.tools,
@@ -725,6 +777,7 @@ pub async fn ollama_chat(
             approval_handler: &approval_handler,
             command_output,
             on_chunk: &on_chunk,
+            on_tool_call: &on_tool_call,
         },
     )
     .await;
@@ -860,8 +913,8 @@ mod tests {
     use super::{
         normalize_endpoint, parse_ndjson_line, run_tool_loop, ApprovalHandler, ChatApiRequest,
         ChatApiResponse, ChatCallback, ChatChunk, ChatMessage, ChatOptions, ChatRequest,
-        LlmBackend, ModelInfo, NdjsonBuffer, ServerStatus, ToolApprovalRequest, ToolLoopCallbacks,
-        MAX_TOOL_ITERATIONS,
+        LlmBackend, ModelInfo, NdjsonBuffer, ServerStatus, ToolApprovalRequest, ToolCallCallback,
+        ToolLoopCallbacks, MAX_TOOL_ITERATIONS,
     };
     use crate::tools::{
         CommandOutputCallback, RiskLevel, Tool, ToolCall, ToolContext, ToolDefinition,
@@ -1083,6 +1136,10 @@ mod tests {
         Arc::new(|_| Ok(()))
     }
 
+    fn tool_call_callback() -> ToolCallCallback {
+        Arc::new(|_| Ok(()))
+    }
+
     #[tokio::test]
     async fn reports_tool_failures_to_model_and_reaches_final_answer() {
         let backend = MockBackend::new(vec![tool_call_response(), final_response()]);
@@ -1107,6 +1164,7 @@ mod tests {
                 approval_handler: &approval,
                 command_output: command_output_callback(),
                 on_chunk: &on_chunk,
+                on_tool_call: &tool_call_callback(),
             },
         )
         .await
@@ -1163,6 +1221,7 @@ mod tests {
                 approval_handler: &approval,
                 command_output: command_output_callback(),
                 on_chunk: &on_chunk,
+                on_tool_call: &tool_call_callback(),
             },
         )
         .await
@@ -1206,6 +1265,7 @@ mod tests {
                 approval_handler: &approval,
                 command_output: command_output_callback(),
                 on_chunk: &on_chunk,
+                on_tool_call: &tool_call_callback(),
             },
         )
         .await

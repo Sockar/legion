@@ -24,6 +24,16 @@ export interface ChatSession {
   model: string;
   settings: ChatSettings;
   archivedAt: string | null;
+  toolCallHistory: ToolCallHistory[];
+}
+
+export interface ToolCallHistory {
+  id: string;
+  toolName: string;
+  arguments: Record<string, unknown>;
+  result: unknown;
+  status: string;
+  createdAt: string;
 }
 
 export interface PersistedSessionState {

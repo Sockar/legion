@@ -15,8 +15,9 @@ system prompt, and is associated with a workspace folder chosen through the
 native folder picker. The Settings panel also stores the Ollama base URL and can
 test the connection. These preferences share the session repository and persist
 across restarts; older saved sessions are restored with the default settings.
-Session persistence is behind a repository interface so the storage can be
-replaced with SQLite later.
+Sessions, messages, tool-call history, and settings are stored in a versioned
+SQLite database in the app's local data directory. Existing browser-stored
+session data is imported on first launch after upgrading.
 
 Chat requests include registered function schemas. The Rust tool registry
 dispatches Ollama tool calls, returns results (including failures) to the model,
