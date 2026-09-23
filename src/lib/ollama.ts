@@ -70,6 +70,16 @@ export interface CommandOutputEvent {
   error: string | null;
 }
 
+export interface ToolCallEvent {
+  id: string;
+  request_id: string;
+  tool_name: string;
+  arguments: Record<string, unknown>;
+  result: unknown;
+  status: string;
+  created_at: string;
+}
+
 export interface ServerStatus {
   connected: boolean;
   endpoint: string;
@@ -126,6 +136,7 @@ export async function streamOllamaChat(
   settings: ChatSettings,
   onChunk: (chunk: ChatChunk) => void,
   onApproval: (approval: ToolApprovalRequest) => void,
+  onToolCall: (event: ToolCallEvent) => void,
   onCommandOutput: (event: CommandOutputEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -137,6 +148,7 @@ export async function streamOllamaChat(
     },
   );
   let unlistenApproval = () => {};
+  let unlistenToolCall = () => {};
   let unlistenCommandOutput = () => {};
   let onAbort: (() => void) | undefined;
 
@@ -145,6 +157,12 @@ export async function streamOllamaChat(
       "tools://approval-request",
       ({ payload }) => {
         if (payload.request_id === requestId) onApproval(payload);
+      },
+    );
+    unlistenToolCall = await listen<ToolCallEvent>(
+      "tools://tool-call",
+      ({ payload }) => {
+        if (payload.request_id === requestId) onToolCall(payload);
       },
     );
     unlistenCommandOutput = await listen<CommandOutputEvent>(
@@ -188,6 +206,7 @@ export async function streamOllamaChat(
     if (onAbort) signal?.removeEventListener("abort", onAbort);
     unlisten();
     unlistenApproval();
+    unlistenToolCall();
     unlistenCommandOutput();
   }
 }

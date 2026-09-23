@@ -7,7 +7,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { SessionSidebar } from "./components/SessionSidebar";
 import { TerminalPanel, type TerminalOutput } from "./components/TerminalPanel";
 import {
-  LocalStorageSessionRepository,
+  SQLiteSessionRepository,
   type SessionRepository,
 } from "./lib/sessionRepository";
 import {
@@ -35,8 +35,7 @@ import "./App.css";
 let nextMessageId = 0;
 
 const emptyMessages: ChatMessage[] = [];
-const sessionRepository: SessionRepository =
-  new LocalStorageSessionRepository();
+const sessionRepository: SessionRepository = new SQLiteSessionRepository();
 const MAX_TERMINAL_OUTPUT_LENGTH = 100_000;
 
 function createMessageId() {
@@ -115,38 +114,40 @@ function App() {
     : null;
 
   useEffect(() => {
-    try {
-      const savedState = sessionRepository.load();
-      const savedActiveSession = savedState.sessions.find(
-        (session) =>
-          session.id === savedState.activeSessionId &&
-          session.archivedAt === null,
-      );
-      setSessionState({
-        ...savedState,
-        activeSessionId:
-          savedActiveSession?.id ??
-          savedState.sessions.find((session) => session.archivedAt === null)
-            ?.id ??
-          null,
-      });
-    } catch (error) {
-      setStorageError(
-        `Unable to restore saved sessions: ${errorMessage(error)}`,
-      );
-    } finally {
-      setIsSessionStateLoaded(true);
-    }
+    void (async () => {
+      try {
+        const savedState = await sessionRepository.load();
+        const savedActiveSession = savedState.sessions.find(
+          (session) =>
+            session.id === savedState.activeSessionId &&
+            session.archivedAt === null,
+        );
+        setSessionState({
+          ...savedState,
+          activeSessionId:
+            savedActiveSession?.id ??
+            savedState.sessions.find((session) => session.archivedAt === null)
+              ?.id ??
+            null,
+        });
+      } catch (error) {
+        setStorageError(
+          `Unable to restore saved sessions: ${errorMessage(error)}`,
+        );
+      } finally {
+        setIsSessionStateLoaded(true);
+      }
+    })();
   }, []);
 
   useEffect(() => {
     if (!isSessionStateLoaded || storageError) return;
 
-    try {
-      sessionRepository.save(sessionState);
-    } catch (error) {
-      setStorageError(`Unable to save sessions: ${errorMessage(error)}`);
-    }
+    void sessionRepository
+      .save(sessionState)
+      .catch((error: unknown) =>
+        setStorageError(`Unable to save sessions: ${errorMessage(error)}`),
+      );
   }, [isSessionStateLoaded, sessionState, storageError]);
 
   useEffect(
@@ -302,6 +303,23 @@ function App() {
                 ? current
                 : [...current, { approval, sessionId }],
             ),
+          (event) =>
+            updateSession(sessionId, (session) =>
+              updateSessionTimestamp({
+                ...session,
+                toolCallHistory: [
+                  ...session.toolCallHistory,
+                  {
+                    id: event.id,
+                    toolName: event.tool_name,
+                    arguments: event.arguments,
+                    result: event.result,
+                    status: event.status,
+                    createdAt: event.created_at,
+                  },
+                ],
+              }),
+            ),
           (event) => updateCommandOutput(sessionId, event),
           controller.signal,
         );
@@ -371,6 +389,7 @@ function App() {
         model: models[0]?.name ?? "",
         settings: DEFAULT_CHAT_SETTINGS,
         archivedAt: null,
+        toolCallHistory: [],
       };
       setSessionState((current) => ({
         ...current,
@@ -472,17 +491,20 @@ function App() {
         id: createMessageId(),
         role: "user",
         content,
+        createdAt: new Date().toISOString(),
       };
       const assistantId = createMessageId();
       const history = [...activeSession.messages, userMessage];
+      const assistantMessage: ChatMessage = {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        createdAt: new Date().toISOString(),
+      };
       updateSession(activeSession.id, (session) =>
         updateSessionTimestamp({
           ...session,
-          messages: [
-            ...session.messages,
-            userMessage,
-            { id: assistantId, role: "assistant", content: "" },
-          ],
+          messages: [...session.messages, userMessage, assistantMessage],
         }),
       );
       void generateResponse(
