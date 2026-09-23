@@ -12,7 +12,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::tools::{RiskLevel, Tool, ToolContext, ToolSchema};
+use crate::{
+    tools::{RiskLevel, Tool, ToolContext, ToolSchema},
+    workspace::{relative_workspace_path, resolve_workspace_path},
+};
 
 const DEFAULT_OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
@@ -113,7 +116,7 @@ impl Tool for GrepSearch {
         let matcher = optional_glob(&arguments)?;
         let context_lines = optional_usize(&arguments, "context_lines", 2)?.min(MAX_CONTEXT_LINES);
         let max_results = optional_usize(&arguments, "max_results", 50)?.clamp(1, MAX_RESULTS);
-        let root = canonical_workspace(&context.workspace)?;
+        let root = resolve_workspace_path(&context.workspace, Path::new("."), true)?;
         let paths = collect_files(&root, matcher.as_ref(), MAX_FILES_SCANNED)?;
         let mut matches = Vec::new();
         let mut skipped_large_files = 0;
@@ -189,7 +192,7 @@ impl Tool for GlobSearch {
             .map_err(|error| format!("Invalid file glob: {error}"))?
             .compile_matcher();
         let max_results = optional_usize(&arguments, "max_results", 100)?.clamp(1, MAX_RESULTS);
-        let root = canonical_workspace(&context.workspace)?;
+        let root = resolve_workspace_path(&context.workspace, Path::new("."), true)?;
         let paths = collect_files(&root, Some(&matcher), MAX_FILES_SCANNED)?;
         let mut results = Vec::new();
         let mut truncated = false;
@@ -224,7 +227,7 @@ impl Tool for IndexWorkspace {
     async fn call(&self, arguments: Value, context: ToolContext) -> Result<Value, String> {
         let model = embedding_model(&arguments)?;
         let endpoint = ollama_endpoint();
-        let root = canonical_workspace(&context.workspace)?;
+        let root = resolve_workspace_path(&context.workspace, Path::new("."), true)?;
         let paths = collect_files(&root, None, MAX_INDEX_FILES)?;
         let mut chunks = Vec::new();
         let mut skipped_large_files = 0;
@@ -319,7 +322,7 @@ impl Tool for SemanticSearch {
         }
         let top_n = optional_usize(&arguments, "top_n", 5)?.clamp(1, 10);
         let model = embedding_model(&arguments)?;
-        let root = canonical_workspace(&context.workspace)?;
+        let root = resolve_workspace_path(&context.workspace, Path::new("."), true)?;
         let index_path = index_path(&root, false)?;
         if !index_path.exists() {
             return Ok(json!({
@@ -428,15 +431,6 @@ fn optional_glob(arguments: &Value) -> Result<Option<GlobMatcher>, String> {
         .map(Option::flatten)
 }
 
-fn canonical_workspace(workspace: &Path) -> Result<PathBuf, String> {
-    let root = fs::canonicalize(workspace)
-        .map_err(|error| format!("Could not resolve workspace folder: {error}"))?;
-    if !root.is_dir() {
-        return Err("Workspace path is not a directory".to_owned());
-    }
-    Ok(root)
-}
-
 fn collect_files(
     root: &Path,
     matcher: Option<&GlobMatcher>,
@@ -462,12 +456,9 @@ fn collect_files(
                     pending.push(entry.path());
                 }
             } else if file_type.is_file() {
-                let path = fs::canonicalize(entry.path())
-                    .map_err(|error| format!("Could not resolve file path: {error}"))?;
-                if !path.starts_with(root) {
-                    continue;
-                }
-                let relative = relative_path(root, &path)?;
+                let relative = relative_workspace_path(root, &entry.path())?;
+                let path = root.join(&relative);
+                let relative = relative.to_string_lossy().replace('\\', "/");
                 let matches = match matcher {
                     Some(matcher) => matcher.is_match(&relative),
                     None => true,
@@ -496,9 +487,7 @@ fn is_ignored_directory(name: &str) -> bool {
 }
 
 fn relative_path(root: &Path, path: &Path) -> Result<String, String> {
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|_| "Search path escapes the workspace folder".to_owned())?;
+    let relative = relative_workspace_path(root, path)?;
     Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
@@ -661,7 +650,9 @@ async fn embed_texts(
 
 fn save_index(root: &Path, index: &SemanticIndex) -> Result<(), String> {
     let path = index_path(root, true)?;
-    let temporary_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let temporary_relative_path =
+        Path::new(INDEX_DIRECTORY).join(format!("{INDEX_FILE}.{}.tmp", std::process::id()));
+    let temporary_path = resolve_workspace_path(root, &temporary_relative_path, false)?;
     let serialized = serde_json::to_vec(index)
         .map_err(|error| format!("Could not encode semantic index: {error}"))?;
     let mut temporary_file = fs::OpenOptions::new()
@@ -678,25 +669,24 @@ fn save_index(root: &Path, index: &SemanticIndex) -> Result<(), String> {
 }
 
 fn index_path(root: &Path, create: bool) -> Result<PathBuf, String> {
-    let directory = root.join(INDEX_DIRECTORY);
+    let directory = resolve_workspace_path(root, Path::new(INDEX_DIRECTORY), false)?;
     if create && !directory.exists() {
         fs::create_dir(&directory)
             .map_err(|error| format!("Could not create semantic index folder: {error}"))?;
     }
     if !directory.exists() {
-        return Ok(directory.join(INDEX_FILE));
+        return resolve_workspace_path(root, &Path::new(INDEX_DIRECTORY).join(INDEX_FILE), false);
     }
-    let resolved_directory = fs::canonicalize(&directory)
-        .map_err(|error| format!("Could not resolve semantic index folder: {error}"))?;
-    if !resolved_directory.starts_with(root) || !resolved_directory.is_dir() {
-        return Err("Semantic index folder escapes the workspace".to_owned());
+    let resolved_directory = resolve_workspace_path(root, Path::new(INDEX_DIRECTORY), true)?;
+    if !resolved_directory.is_dir() {
+        return Err("Semantic index folder is not a directory".to_owned());
     }
-    let path = resolved_directory.join(INDEX_FILE);
+    let path = resolve_workspace_path(root, &Path::new(INDEX_DIRECTORY).join(INDEX_FILE), false)?;
     if path.exists() {
-        let resolved_path = fs::canonicalize(&path)
-            .map_err(|error| format!("Could not resolve semantic index path: {error}"))?;
-        if !resolved_path.starts_with(root) || !resolved_path.is_file() {
-            return Err("Semantic index path escapes the workspace".to_owned());
+        let resolved_path =
+            resolve_workspace_path(root, &Path::new(INDEX_DIRECTORY).join(INDEX_FILE), true)?;
+        if !resolved_path.is_file() {
+            return Err("Semantic index path is not a file".to_owned());
         }
         return Ok(resolved_path);
     }

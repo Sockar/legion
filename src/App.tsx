@@ -66,6 +66,7 @@ function App() {
     sessions: [],
     activeSessionId: null,
     ollamaEndpoint: DEFAULT_OLLAMA_ENDPOINT,
+    toolAuditLog: [],
   });
   const [isSessionStateLoaded, setIsSessionStateLoaded] = useState(false);
   const [storageError, setStorageError] = useState("");
@@ -272,6 +273,7 @@ function App() {
 
       try {
         await streamOllamaChat(
+          sessionId,
           model,
           [
             ...(settings.systemPrompt.trim()
@@ -304,22 +306,42 @@ function App() {
                 : [...current, { approval, sessionId }],
             ),
           (event) =>
-            updateSession(sessionId, (session) =>
-              updateSessionTimestamp({
-                ...session,
-                toolCallHistory: [
-                  ...session.toolCallHistory,
-                  {
-                    id: event.id,
-                    toolName: event.tool_name,
-                    arguments: event.arguments,
-                    result: event.result,
-                    status: event.status,
-                    createdAt: event.created_at,
-                  },
-                ],
-              }),
-            ),
+            setSessionState((current) => ({
+              ...current,
+              toolAuditLog: [
+                ...current.toolAuditLog,
+                {
+                  id: event.id,
+                  sessionId,
+                  toolName: event.tool_name,
+                  argumentsSummary: event.arguments_summary,
+                  approvalStatus: event.approval_status,
+                  executionStatus:
+                    event.approval_status === "rejected"
+                      ? "not_run"
+                      : event.status,
+                  createdAt: event.created_at,
+                },
+              ],
+              sessions: current.sessions.map((session) =>
+                session.id === sessionId
+                  ? updateSessionTimestamp({
+                      ...session,
+                      toolCallHistory: [
+                        ...session.toolCallHistory,
+                        {
+                          id: event.id,
+                          toolName: event.tool_name,
+                          arguments: event.arguments,
+                          result: event.result,
+                          status: event.status,
+                          createdAt: event.created_at,
+                        },
+                      ],
+                    })
+                  : session,
+              ),
+            })),
           (event) => updateCommandOutput(sessionId, event),
           controller.signal,
         );
@@ -737,6 +759,7 @@ function App() {
           key={activeSession?.id ?? "no-active-session"}
           activeSession={activeSession}
           endpoint={sessionState.ollamaEndpoint}
+          toolAuditLog={sessionState.toolAuditLog}
           models={models}
           onClose={() => setIsSettingsOpen(false)}
           onSave={handleSaveSettings}

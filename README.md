@@ -31,10 +31,22 @@ files unless `overwrite` is explicitly true. Edits use an exact `old_str` to
 `new_str` replacement and reject missing or ambiguous matches. File mutations
 require approval and show a highlighted diff in the chat before writing.
 The high-risk `run_command` tool also requires confirmation and displays the
-exact command before execution. It runs in the active workspace, streams
-stdout/stderr to the terminal panel, and stops after 60 seconds by default
-(configurable up to 10 minutes). Commands are not sandboxed; broader command
-sandboxing and restrictions are tracked separately in issue #12.
+exact command before execution. A first-layer deny-list in
+`src-tauri/src/security.rs` rejects selected destructive command patterns before
+they can be approved. It runs in the active workspace, streams stdout/stderr to
+the terminal panel, and stops after 60 seconds by default (configurable up to 10
+minutes). The Settings panel includes a per-session strict mode that requires
+approval for every tool call, including read-only tools. Tool calls and their
+approval/execution outcomes are appended to the local SQLite audit log and
+recent activity can be reviewed in Settings.
+
+These controls are defense in depth, not a full OS-level sandbox. The command
+deny-list is intentionally incomplete and can be bypassed by unlisted commands,
+scripts, or command interpreters; approved shell commands can still access
+files outside the workspace. Workspace path validation canonicalizes paths and
+checks symlinks, but cannot eliminate filesystem race conditions. Use strict
+mode when you want to review every tool invocation, and do not run Legion with
+privileges you would not grant to the agent.
 New tools implement the Rust `Tool` trait and can be registered on
 `BackendState` before it is shared.
 

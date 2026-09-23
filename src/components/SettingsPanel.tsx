@@ -7,12 +7,14 @@ import {
   DEFAULT_CHAT_SETTINGS,
   type ChatSession,
   type ChatSettings,
+  type ToolAuditRecord,
 } from "../types/session";
 import type { ModelInfo, ServerStatus } from "../lib/ollama";
 
 interface SettingsPanelProps {
   activeSession: ChatSession | null;
   endpoint: string;
+  toolAuditLog: ToolAuditRecord[];
   models: ModelInfo[];
   onClose: () => void;
   onSave: (
@@ -27,6 +29,7 @@ interface SettingsPanelProps {
 export function SettingsPanel({
   activeSession,
   endpoint,
+  toolAuditLog,
   models,
   onClose,
   onSave,
@@ -79,6 +82,11 @@ export function SettingsPanel({
       setIsCheckingUpdates(false);
     }
   };
+
+  const recentToolCalls = toolAuditLog
+    .filter((record) => record.sessionId === activeSession?.id)
+    .slice(-50)
+    .reverse();
 
   const updateNumber = (
     key: "temperature" | "topP" | "numCtx",
@@ -237,6 +245,46 @@ export function SettingsPanel({
                   value={settings.systemPrompt}
                 />
               </label>
+              <label className="settings-panel__toggle">
+                <input
+                  checked={settings.strictMode}
+                  onChange={(event) =>
+                    setSettings((current) => ({
+                      ...current,
+                      strictMode: event.target.checked,
+                    }))
+                  }
+                  type="checkbox"
+                />
+                <span>
+                  Strict mode — require approval for every tool call, including
+                  read-only tools.
+                </span>
+              </label>
+            </fieldset>
+
+            <fieldset>
+              <legend>Recent tool activity</legend>
+              {!activeSession ? (
+                <p>Select a session to review its audit log.</p>
+              ) : recentToolCalls.length ? (
+                <ol className="settings-panel__audit-log">
+                  {recentToolCalls.map((record) => (
+                    <li key={record.id}>
+                      <details>
+                        <summary>
+                          {new Date(Number(record.createdAt)).toLocaleString()}{" "}
+                          · {record.toolName} · {record.approvalStatus} ·{" "}
+                          {record.executionStatus}
+                        </summary>
+                        <pre>{record.argumentsSummary}</pre>
+                      </details>
+                    </li>
+                  ))}
+                </ol>
+              ) : (
+                <p>No tool calls have been recorded for this session.</p>
+              )}
             </fieldset>
 
             <fieldset>
