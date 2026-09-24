@@ -88,12 +88,23 @@ export interface ServerStatus {
   message: string;
 }
 
+export interface DownloadProgress {
+  request_id: string;
+  name: string;
+  status: string;
+  total?: number | null;
+  completed?: number | null;
+  percentage?: number | null;
+}
+
 export interface PullProgress {
   request_id: string;
+  name: string;
   status: string;
   digest?: string | null;
   total?: number | null;
   completed?: number | null;
+  percentage?: number | null;
 }
 
 export interface ChatChunk {
@@ -106,8 +117,21 @@ export async function getOllamaStatus(endpoint: string): Promise<ServerStatus> {
   return invoke<ServerStatus>("ollama_status", { endpoint });
 }
 
-export async function installOllama(): Promise<string> {
-  return invoke<string>("install_ollama");
+export async function installOllama(
+  onProgress: (progress: DownloadProgress) => void,
+): Promise<string> {
+  const requestId = crypto.randomUUID();
+  const unlisten = await listen<DownloadProgress>(
+    "ollama://install-progress",
+    ({ payload }) => {
+      if (payload.request_id === requestId) onProgress(payload);
+    },
+  );
+  try {
+    return await invoke<string>("install_ollama", { requestId });
+  } finally {
+    unlisten();
+  }
 }
 
 export async function listOllamaModels(endpoint: string): Promise<ModelInfo[]> {

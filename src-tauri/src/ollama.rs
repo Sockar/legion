@@ -31,6 +31,16 @@ pub type ProgressCallback = Arc<dyn Fn(PullProgress) -> Result<(), String> + Sen
 pub type ChatCallback = Arc<dyn Fn(ChatChunk) -> Result<(), String> + Send + Sync>;
 pub type ToolCallCallback = Arc<dyn Fn(ToolCallEvent) -> Result<(), String> + Send + Sync>;
 
+fn emit_pull_progress(
+    mut progress: PullProgress,
+    request_id: &str,
+    emit: impl FnOnce(&'static str, PullProgress) -> Result<(), String>,
+) -> Result<(), String> {
+    progress.request_id = request_id.to_owned();
+    emit(PULL_PROGRESS_EVENT, progress)
+        .map_err(|error| format!("Could not emit model pull progress: {error}"))
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ToolCallEvent {
     pub id: String,
@@ -188,21 +198,19 @@ impl LlmBackend for OllamaBackend {
         let response = self
             .client
             .post(self.api_url(endpoint, "/api/pull")?)
-            .json(&PullRequest { name: model })
+            .json(&PullRequest {
+                name: model.clone(),
+            })
             .send()
             .await
             .map_err(|error| format!("Could not reach Ollama: {error}"))?;
         let response = ensure_success(response).await?;
 
+        let mut aggregator = PullProgressAggregator::default();
+        let model_name = model;
         read_ndjson(response, |line| {
             let item: OllamaPullProgress = parse_ndjson_line(line)?;
-            on_progress(PullProgress {
-                request_id: String::new(),
-                status: item.status,
-                digest: item.digest,
-                total: item.total,
-                completed: item.completed,
-            })?;
+            on_progress(aggregator.update(&model_name, item))?;
             Ok(())
         })
         .await
@@ -418,6 +426,65 @@ struct OllamaPullProgress {
     completed: Option<u64>,
 }
 
+#[derive(Default)]
+struct PullProgressAggregator {
+    layers: HashMap<String, (u64, u64)>,
+}
+
+impl PullProgressAggregator {
+    fn update(&mut self, model: &str, item: OllamaPullProgress) -> PullProgress {
+        if let (Some(digest), Some(total)) = (&item.digest, item.total) {
+            let completed = item.completed.unwrap_or_default().min(total);
+            self.layers.insert(digest.clone(), (total, completed));
+        }
+
+        let (total, mut completed) = if self.layers.is_empty() {
+            (item.total, item.completed)
+        } else {
+            (
+                Some(
+                    self.layers
+                        .values()
+                        .map(|(total, _)| total)
+                        .copied()
+                        .fold(0_u64, u64::saturating_add),
+                ),
+                Some(
+                    self.layers
+                        .values()
+                        .map(|(_, completed)| completed)
+                        .copied()
+                        .fold(0_u64, u64::saturating_add),
+                ),
+            )
+        };
+        let succeeded = item.status == "success";
+        if succeeded {
+            completed = total.or(completed);
+        }
+        let percentage = if succeeded {
+            Some(100)
+        } else {
+            total
+                .filter(|total| *total > 0)
+                .zip(completed)
+                .map(|(total, completed)| {
+                    ((completed.min(total) as f64 / total as f64) * 100.0).round() as u8
+                })
+        };
+
+        PullProgress {
+            request_id: String::new(),
+            name: model.to_owned(),
+            status: item.status,
+            digest: item.digest,
+            total,
+            completed,
+            percentage,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatApiResponse {
     #[serde(default)]
@@ -434,10 +501,12 @@ pub struct ServerStatus {
 #[derive(Clone, Debug, Serialize)]
 pub struct PullProgress {
     pub request_id: String,
+    pub name: String,
     pub status: String,
     pub digest: Option<String>,
     pub total: Option<u64>,
     pub completed: Option<u64>,
+    pub percentage: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -761,11 +830,12 @@ pub async fn ollama_pull_model(
 ) -> Result<(), String> {
     let progress_app = app.clone();
     let progress_request_id = request_id.clone();
-    let on_progress = Arc::new(move |mut progress: PullProgress| {
-        progress.request_id.clone_from(&progress_request_id);
-        progress_app
-            .emit(PULL_PROGRESS_EVENT, progress)
-            .map_err(|error| format!("Could not emit model pull progress: {error}"))
+    let on_progress = Arc::new(move |progress: PullProgress| {
+        emit_pull_progress(progress, &progress_request_id, |event, progress| {
+            progress_app
+                .emit(event, progress)
+                .map_err(|error| error.to_string())
+        })
     });
     backend
         .backend
@@ -981,9 +1051,10 @@ impl NdjsonBuffer {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_endpoint, parse_ndjson_line, run_tool_loop, ApprovalHandler, ChatApiRequest,
-        ChatApiResponse, ChatCallback, ChatChunk, ChatMessage, ChatOptions, ChatRequest,
-        LlmBackend, ModelInfo, NdjsonBuffer, ServerStatus, ToolApprovalRequest, ToolCallCallback,
+        emit_pull_progress, normalize_endpoint, parse_ndjson_line, run_tool_loop, ApprovalHandler,
+        ChatApiRequest, ChatApiResponse, ChatCallback, ChatChunk, ChatMessage, ChatOptions,
+        ChatRequest, LlmBackend, ModelInfo, NdjsonBuffer, OllamaBackend, OllamaPullProgress,
+        PullProgress, PullProgressAggregator, ServerStatus, ToolApprovalRequest, ToolCallCallback,
         ToolLoopCallbacks, MAX_TOOL_ITERATIONS,
     };
     use crate::tools::{
@@ -1000,7 +1071,117 @@ mod tests {
             Arc, Mutex,
         },
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn aggregates_pull_progress_across_layers_and_marks_success() {
+        let mut aggregator = PullProgressAggregator::default();
+        let first = aggregator.update(
+            "llama3.1:8b",
+            OllamaPullProgress {
+                status: "pulling".to_owned(),
+                digest: Some("layer-a".to_owned()),
+                total: Some(100),
+                completed: Some(50),
+            },
+        );
+        assert_eq!(first.total, Some(100));
+        assert_eq!(first.completed, Some(50));
+        assert_eq!(first.percentage, Some(50));
+        assert_eq!(first.name, "llama3.1:8b");
+
+        let second = aggregator.update(
+            "llama3.1:8b",
+            OllamaPullProgress {
+                status: "pulling".to_owned(),
+                digest: Some("layer-b".to_owned()),
+                total: Some(300),
+                completed: Some(100),
+            },
+        );
+        assert_eq!(second.total, Some(400));
+        assert_eq!(second.completed, Some(150));
+        assert_eq!(second.percentage, Some(38));
+
+        let complete = aggregator.update(
+            "llama3.1:8b",
+            OllamaPullProgress {
+                status: "success".to_owned(),
+                digest: None,
+                total: None,
+                completed: None,
+            },
+        );
+        assert_eq!(complete.completed, Some(400));
+        assert_eq!(complete.percentage, Some(100));
+    }
+
+    #[test]
+    fn emits_aggregated_model_progress_with_request_id() {
+        let mut emitted = None;
+        emit_pull_progress(
+            PullProgress {
+                request_id: String::new(),
+                name: "llama3.1:8b".to_owned(),
+                status: "pulling".to_owned(),
+                digest: Some("layer-a".to_owned()),
+                total: Some(100),
+                completed: Some(25),
+                percentage: Some(25),
+            },
+            "request-1",
+            |event, progress| {
+                emitted = Some((event, progress));
+                Ok(())
+            },
+        )
+        .expect("progress event is emitted");
+
+        let (event, progress) = emitted.expect("emitter receives the event");
+        assert_eq!(event, super::PULL_PROGRESS_EVENT);
+        assert_eq!(progress.request_id, "request-1");
+        assert_eq!(progress.name, "llama3.1:8b");
+        assert_eq!(progress.percentage, Some(25));
+    }
+
+    #[tokio::test]
+    async fn fetches_installed_models_from_the_ollama_tags_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local HTTP listener starts");
+        let address = listener
+            .local_addr()
+            .expect("listener address is available");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("request is accepted");
+            let mut request = [0_u8; 1024];
+            let bytes_read = stream.read(&mut request).await.expect("request is read");
+            let request = String::from_utf8_lossy(&request[..bytes_read]);
+            assert!(request.starts_with("GET /api/tags HTTP/1.1"));
+            let body = r#"{"models":[{"name":"qwen2.5:7b","size":123,"digest":"abc"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("response is written");
+        });
+
+        let backend = OllamaBackend::new(format!("http://{address}"));
+        let models = backend
+            .list_models(&format!("http://{address}"))
+            .await
+            .expect("model list is returned");
+        server.await.expect("local server completes");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "qwen2.5:7b");
+        assert_eq!(models[0].size, 123);
+    }
 
     #[test]
     fn validates_ollama_endpoint_and_sampling_options() {

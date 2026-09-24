@@ -6,11 +6,11 @@ use std::{
 
 use futures_util::StreamExt;
 use reqwest::{header::ACCEPT, Client, Url};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::AppHandle;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use tauri::Manager;
+use tauri::{AppHandle, Emitter};
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
@@ -19,6 +19,69 @@ use tokio::{
 
 const RELEASE_API: &str = "https://api.github.com/repos/ollama/ollama/releases/latest";
 const MAX_DOWNLOAD_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+const INSTALL_PROGRESS_EVENT: &str = "ollama://install-progress";
+
+#[derive(Clone, Debug, Serialize)]
+pub struct InstallProgress {
+    pub request_id: String,
+    pub name: String,
+    pub status: String,
+    pub total: Option<u64>,
+    pub completed: u64,
+    pub percentage: Option<u8>,
+}
+
+fn install_progress(
+    request_id: &str,
+    name: &str,
+    status: &str,
+    total: Option<u64>,
+    completed: u64,
+) -> InstallProgress {
+    InstallProgress {
+        request_id: request_id.to_owned(),
+        name: name.to_owned(),
+        status: status.to_owned(),
+        total,
+        completed,
+        percentage: total
+            .filter(|total| *total > 0)
+            .map(|total| ((completed.min(total) as f64 / total as f64) * 100.0).round() as u8),
+    }
+}
+
+fn emit_install_progress(
+    app: &AppHandle,
+    request_id: &str,
+    name: &str,
+    status: &str,
+    total: Option<u64>,
+    completed: u64,
+) -> Result<(), String> {
+    emit_install_progress_with(
+        request_id,
+        name,
+        status,
+        total,
+        completed,
+        |event, progress| app.emit(event, progress).map_err(|error| error.to_string()),
+    )
+}
+
+fn emit_install_progress_with(
+    request_id: &str,
+    name: &str,
+    status: &str,
+    total: Option<u64>,
+    completed: u64,
+    emit: impl FnOnce(&'static str, InstallProgress) -> Result<(), String>,
+) -> Result<(), String> {
+    emit(
+        INSTALL_PROGRESS_EVENT,
+        install_progress(request_id, name, status, total, completed),
+    )
+    .map_err(|error| format!("Could not emit Ollama installation progress: {error}"))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InstallerTarget {
@@ -127,6 +190,8 @@ fn validate_release_asset(target: InstallerTarget, asset: &ReleaseAsset) -> Resu
 }
 
 async fn download_release_asset(
+    app: &AppHandle,
+    request_id: &str,
     client: &Client,
     target: InstallerTarget,
     asset: &ReleaseAsset,
@@ -163,10 +228,8 @@ async fn download_release_asset(
             "The Ollama download returned unexpected content type '{content_type}'."
         ));
     }
-    if response
-        .content_length()
-        .is_some_and(|length| length != asset.size || length > MAX_DOWNLOAD_BYTES)
-    {
+    let total = response.content_length();
+    if total.is_some_and(|length| length != asset.size || length > MAX_DOWNLOAD_BYTES) {
         return Err(
             "The Ollama download size did not match the published release asset.".to_owned(),
         );
@@ -178,6 +241,14 @@ async fn download_release_asset(
     let mut stream = response.bytes_stream();
     let mut downloaded = 0_u64;
     let mut hasher = Sha256::new();
+    emit_install_progress(
+        app,
+        request_id,
+        &asset.name,
+        "Downloading",
+        total,
+        downloaded,
+    )?;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| format!("Ollama download failed: {error}"))?;
         downloaded = downloaded
@@ -188,6 +259,14 @@ async fn download_release_asset(
         file.write_all(&chunk)
             .await
             .map_err(|error| format!("Could not save the Ollama download: {error}"))?;
+        emit_install_progress(
+            app,
+            request_id,
+            &asset.name,
+            "Downloading",
+            total,
+            downloaded,
+        )?;
     }
     file.flush()
         .await
@@ -255,7 +334,7 @@ async fn latest_release_asset(
 }
 
 #[tauri::command]
-pub async fn install_ollama(app: AppHandle) -> Result<String, String> {
+pub async fn install_ollama(app: AppHandle, request_id: String) -> Result<String, String> {
     let target = installer_target(env::consts::OS, env::consts::ARCH)?;
     let client = Client::builder()
         .user_agent("Legion desktop app")
@@ -277,7 +356,7 @@ pub async fn install_ollama(app: AppHandle) -> Result<String, String> {
     let _temporary_directory = TemporaryDirectory(temp_path.clone());
     let installer_path = temp_path.join(&asset.name);
     let checksum_verified =
-        download_release_asset(&client, target, &asset, &installer_path).await?;
+        download_release_asset(&app, &request_id, &client, target, &asset, &installer_path).await?;
 
     #[cfg(target_os = "windows")]
     install_windows(&app, &installer_path).await?;
@@ -498,9 +577,52 @@ async fn start_server(executable: &Path) -> Result<(), String> {
 mod tests {
     use std::fs as std_fs;
 
+    #[test]
+    fn reports_installer_download_bytes_and_percentage() {
+        let progress = install_progress(
+            "request-1",
+            "OllamaSetup.exe",
+            "Downloading",
+            Some(1000),
+            425,
+        );
+        assert_eq!(progress.request_id, "request-1");
+        assert_eq!(progress.name, "OllamaSetup.exe");
+        assert_eq!(progress.total, Some(1000));
+        assert_eq!(progress.completed, 425);
+        assert_eq!(progress.percentage, Some(43));
+
+        let unknown_size = install_progress("request-1", "installer", "Downloading", None, 42);
+        assert_eq!(unknown_size.percentage, None);
+    }
+
     use super::{
-        installer_target, replace_directory, validate_release_asset, InstallerTarget, ReleaseAsset,
+        emit_install_progress_with, install_progress, installer_target, replace_directory,
+        validate_release_asset, InstallerTarget, ReleaseAsset, INSTALL_PROGRESS_EVENT,
     };
+
+    #[test]
+    fn emits_installer_progress_events_with_content_length_and_received_bytes() {
+        let mut emitted = None;
+        emit_install_progress_with(
+            "request-1",
+            "OllamaSetup.exe",
+            "Downloading",
+            Some(200),
+            50,
+            |event, progress| {
+                emitted = Some((event, progress));
+                Ok(())
+            },
+        )
+        .expect("progress event is emitted");
+
+        let (event, progress) = emitted.expect("emitter receives the event");
+        assert_eq!(event, INSTALL_PROGRESS_EVENT);
+        assert_eq!(progress.total, Some(200));
+        assert_eq!(progress.completed, 50);
+        assert_eq!(progress.percentage, Some(25));
+    }
 
     #[test]
     fn selects_official_release_asset_for_supported_platforms() {

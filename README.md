@@ -7,7 +7,10 @@ to work with local and open-source language models, including models served by
 The app includes a chat interface with streaming Markdown responses and code
 copying, powered by the local [Ollama](https://ollama.com/) HTTP API. The app
 detects the server at `http://localhost:11434`, lists installed models, streams
-model-pull progress, and streams chat responses.
+model-pull progress, and streams chat responses. Settings includes popular
+recommended models to download and an advanced manual model-name option.
+Model and installer downloads show byte and percentage progress, with success
+and error feedback.
 
 Chat sessions are stored locally and restored when the app restarts. Each
 session keeps its own conversation, model selection, sampling parameters, and
@@ -107,7 +110,9 @@ startup fails, the app reports the error and offers the manual download page.
 Check the frontend and Rust code with:
 
 ```sh
+npm test
 npm run lint
+npm run build
 npm run format:check
 cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
