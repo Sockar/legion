@@ -1081,15 +1081,13 @@ function App() {
             aria-labelledby="tool-approval-title"
           >
             <h2 id="tool-approval-title">
-              {currentToolApproval.approval_type ===
-              "out_of_workspace_access"
+              {currentToolApproval.approval_type === "out_of_workspace_access"
                 ? "Allow access outside the workspace?"
                 : currentToolApproval.preview
-                ? "Review proposed file change"
-                : "Allow tool execution?"}
+                  ? "Review proposed file change"
+                  : "Allow tool execution?"}
             </h2>
-            {currentToolApproval.approval_type ===
-            "out_of_workspace_access" ? (
+            {currentToolApproval.approval_type === "out_of_workspace_access" ? (
               <OutOfWorkspaceApproval
                 path={currentToolApproval.requested_path ?? ""}
                 disabled={
