@@ -1,10 +1,8 @@
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FileChangeReview } from "./components/FileChangeReview";
 import { ChatInput } from "./components/ChatInput";
 import { MessageList } from "./components/MessageList";
-import { OutOfWorkspaceApproval } from "./components/OutOfWorkspaceApproval";
 import {
   DownloadProgress,
   type DownloadFeedback,
@@ -109,7 +107,12 @@ function App() {
     () => new Set(),
   );
   const [toolApprovals, setToolApprovals] = useState<
-    { approval: ToolApprovalRequest; sessionId: string }[]
+    {
+      approval: ToolApprovalRequest;
+      sessionId: string;
+      assistantId: string;
+      decision?: ApprovalDecision;
+    }[]
   >([]);
   const [resolvingApprovalId, setResolvingApprovalId] = useState<string>();
   const [commandOutputs, setCommandOutputs] = useState<
@@ -131,18 +134,6 @@ function App() {
   const isStreaming = activeSession
     ? streamingSessionIds.has(activeSession.id)
     : false;
-  const currentToolApproval = toolApprovals[0]?.approval;
-  const approvalCommand =
-    currentToolApproval?.tool.name === "run_command" &&
-    typeof currentToolApproval.arguments.command === "string"
-      ? currentToolApproval.arguments.command
-      : null;
-  const inlineFileApproval =
-    activeSession &&
-    toolApprovals[0]?.sessionId === activeSession.id &&
-    currentToolApproval?.preview
-      ? currentToolApproval
-      : undefined;
   const activeCommandOutput = activeSession
     ? (commandOutputs[activeSession.id] ?? null)
     : null;
@@ -358,7 +349,7 @@ function App() {
                   pending.approval.approval_id === approval.approval_id,
               )
                 ? current
-                : [...current, { approval, sessionId }],
+                : [...current, { approval, sessionId, assistantId }],
             ),
           (event) =>
             setSessionState((current) => ({
@@ -437,7 +428,11 @@ function App() {
             return next;
           });
           setToolApprovals((current) =>
-            current.filter((pending) => pending.sessionId !== sessionId),
+            current.filter(
+              (pending) =>
+                pending.sessionId !== sessionId ||
+                pending.decision !== undefined,
+            ),
           );
         }
       }
@@ -609,15 +604,21 @@ function App() {
   }, [activeSession]);
 
   const handleToolApproval = useCallback(
-    async (decision: ApprovalDecision) => {
-      if (!currentToolApproval || resolvingApprovalId) return;
-      setResolvingApprovalId(currentToolApproval.approval_id);
+    async (approvalId: string, decision: ApprovalDecision) => {
+      if (resolvingApprovalId) return;
+      const pendingApproval = toolApprovals.find(
+        (entry) => entry.approval.approval_id === approvalId,
+      );
+      if (!pendingApproval || pendingApproval.decision !== undefined) return;
+
+      setResolvingApprovalId(approvalId);
       try {
-        await respondToToolApproval(currentToolApproval.approval_id, decision);
+        await respondToToolApproval(approvalId, decision);
         setToolApprovals((current) =>
-          current.filter(
-            (pending) =>
-              pending.approval.approval_id !== currentToolApproval.approval_id,
+          current.map((pending) =>
+            pending.approval.approval_id === approvalId
+              ? { ...pending, decision }
+              : pending,
           ),
         );
       } catch (error) {
@@ -626,7 +627,7 @@ function App() {
         setResolvingApprovalId(undefined);
       }
     },
-    [currentToolApproval, resolvingApprovalId],
+    [resolvingApprovalId, toolApprovals],
   );
 
   const handleRegenerate = useCallback(
@@ -1068,83 +1069,6 @@ function App() {
         />
       )}
 
-      {currentToolApproval && !inlineFileApproval && (
-        <div className="tool-approval-backdrop">
-          <section
-            className="tool-approval"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="tool-approval-title"
-          >
-            <h2 id="tool-approval-title">
-              {currentToolApproval.approval_type === "out_of_workspace_access"
-                ? "Allow access outside the workspace?"
-                : currentToolApproval.preview
-                  ? "Review proposed file change"
-                  : "Allow tool execution?"}
-            </h2>
-            {currentToolApproval.approval_type === "out_of_workspace_access" ? (
-              <OutOfWorkspaceApproval
-                path={currentToolApproval.requested_path ?? ""}
-                disabled={
-                  resolvingApprovalId === currentToolApproval.approval_id
-                }
-                onDecision={(decision) => void handleToolApproval(decision)}
-              />
-            ) : currentToolApproval.preview ? (
-              <FileChangeReview
-                preview={currentToolApproval.preview}
-                disabled={
-                  resolvingApprovalId === currentToolApproval.approval_id
-                }
-                onAccept={() => void handleToolApproval("allow_once")}
-                onReject={() => void handleToolApproval("deny")}
-              />
-            ) : (
-              <>
-                <p>
-                  <strong>{currentToolApproval.tool.name}</strong>
-                  {`: ${currentToolApproval.tool.description}`}
-                </p>
-                {approvalCommand !== null ? (
-                  <>
-                    <p className="tool-approval__command-label">
-                      Exact command to run:
-                    </p>
-                    <pre>{approvalCommand}</pre>
-                  </>
-                ) : (
-                  <pre>
-                    {JSON.stringify(currentToolApproval.arguments, null, 2)}
-                  </pre>
-                )}
-                <div className="tool-approval__actions">
-                  <button
-                    type="button"
-                    disabled={
-                      resolvingApprovalId === currentToolApproval.approval_id
-                    }
-                    onClick={() => void handleToolApproval("deny")}
-                  >
-                    Deny
-                  </button>
-                  <button
-                    className="tool-approval__allow"
-                    type="button"
-                    disabled={
-                      resolvingApprovalId === currentToolApproval.approval_id
-                    }
-                    onClick={() => void handleToolApproval("allow_once")}
-                  >
-                    Allow once
-                  </button>
-                </div>
-              </>
-            )}
-          </section>
-        </div>
-      )}
-
       <div className="chat-body">
         <SessionSidebar
           activeSessionId={activeSession?.id ?? null}
@@ -1197,16 +1121,19 @@ function App() {
                   messages={messages}
                   isStreaming={isStreaming}
                   onRegenerate={handleRegenerate}
-                />
-              )}
-              {inlineFileApproval?.preview && (
-                <FileChangeReview
-                  preview={inlineFileApproval.preview}
-                  disabled={
-                    resolvingApprovalId === inlineFileApproval.approval_id
-                  }
-                  onAccept={() => void handleToolApproval("allow_once")}
-                  onReject={() => void handleToolApproval("deny")}
+                  approvals={toolApprovals
+                    .filter((entry) => entry.sessionId === activeSession.id)
+                    .map((entry) => ({
+                      ...entry,
+                      disabled:
+                        entry.decision !== undefined ||
+                        resolvingApprovalId !== undefined,
+                      onDecision: (decision: ApprovalDecision) =>
+                        void handleToolApproval(
+                          entry.approval.approval_id,
+                          decision,
+                        ),
+                    }))}
                 />
               )}
               <div ref={bottomRef} />
