@@ -885,37 +885,47 @@ button:disabled {
   font-size: 0.78rem;
 }
 
-.tool-approval-backdrop {
-  position: fixed;
-  z-index: 5;
-  display: grid;
-  place-items: center;
-  padding: 20px;
-  background: #0009;
-  inset: 0;
-}
-
-.tool-approval {
-  width: min(100%, 480px);
+.tool-approval-cell {
+  width: min(calc(100% - 84px), 802px);
+  margin: -12px auto 28px;
   border: 1px solid #454650;
-  border-radius: 12px;
-  padding: 20px;
-  background: #191a1f;
-  box-shadow: 0 16px 48px #0008;
+  border-radius: 10px;
+  padding: 14px;
+  background: #1b1c22;
+  color: #d8d8dd;
 }
 
-.tool-approval h2 {
-  margin: 0 0 12px;
-  font-size: 1.05rem;
+.tool-approval-cell__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
 }
 
-.tool-approval p {
+.tool-approval-cell__heading h3 {
+  margin: 0;
+  color: #f1f1f3;
+  font-size: 0.9rem;
+}
+
+.tool-approval-cell__decision {
+  flex: 0 0 auto;
+  border: 1px solid #454650;
+  border-radius: 999px;
+  padding: 3px 9px;
+  background: #202127;
+  color: #b6b7c0;
+  font-size: 0.72rem;
+}
+
+.tool-approval-cell p {
   color: #c5c6ce;
   font-size: 0.86rem;
   line-height: 1.5;
 }
 
-.tool-approval pre {
+.tool-approval-cell pre {
   max-height: 180px;
   overflow: auto;
   border: 1px solid #34353d;
@@ -949,8 +959,12 @@ button:disabled {
 
 .tool-approval__actions button:disabled,
 .file-change-review__actions button:disabled {
-  cursor: wait;
-  opacity: 0.6;
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.tool-approval-cell > .file-change-review {
+  margin: 0;
 }
 
 .file-change-review {
