@@ -214,6 +214,41 @@ button:disabled {
   color: #d7d8df;
 }
 
+.reasoning-section {
+  margin: 8px 0 12px;
+  border: 1px solid #34353d;
+  border-radius: 8px;
+  background: #1b1c21;
+  color: #a6a7b0;
+  font-size: 0.86rem;
+}
+
+.reasoning-section__toggle {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  padding: 8px 10px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.reasoning-section__toggle span:last-child {
+  margin-left: auto;
+}
+
+.reasoning-section__content {
+  border-top: 1px solid #34353d;
+  padding: 9px 10px;
+  color: #b6b7c0;
+  font-style: italic;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .message__text {
   white-space: pre-wrap;
   overflow-wrap: anywhere;

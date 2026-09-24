@@ -2,6 +2,7 @@ import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import type { ChatMessage } from "../types/chat";
 import { CodeBlock } from "./CodeBlock";
+import { ReasoningSection } from "./ReasoningSection";
 
 interface MessageBubbleProps {
   canRegenerate: boolean;
@@ -36,6 +37,13 @@ export function MessageBubble({
             </button>
           )}
         </div>
+        {!isUser && message.reasoning && (
+          <ReasoningSection
+            hasFinalContent={Boolean(message.content)}
+            isStreaming={isStreaming}
+            reasoning={message.reasoning}
+          />
+        )}
         {isUser ? (
           <div className="message__text">{message.content}</div>
         ) : message.content ? (

@@ -6,6 +6,7 @@ export interface ChatSettings {
   numCtx: number;
   systemPrompt: string;
   strictMode: boolean;
+  enableReasoning: boolean;
 }
 
 export const DEFAULT_CHAT_SETTINGS: ChatSettings = {
@@ -14,6 +15,7 @@ export const DEFAULT_CHAT_SETTINGS: ChatSettings = {
   numCtx: 4096,
   systemPrompt: "",
   strictMode: false,
+  enableReasoning: false,
 };
 
 export interface ChatSession {

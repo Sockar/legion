@@ -300,6 +300,19 @@ export function SettingsPanel({
                   read-only tools.
                 </span>
               </label>
+              <label className="settings-panel__toggle">
+                <input
+                  checked={settings.enableReasoning}
+                  onChange={(event) =>
+                    setSettings((current) => ({
+                      ...current,
+                      enableReasoning: event.target.checked,
+                    }))
+                  }
+                  type="checkbox"
+                />
+                <span>Enable model reasoning (if supported)</span>
+              </label>
             </fieldset>
 
             <fieldset>
