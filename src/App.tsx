@@ -16,6 +16,7 @@ import {
   SQLiteSessionRepository,
   type SessionRepository,
 } from "./lib/sessionRepository";
+import { buildChatMessages } from "./lib/chatMessages";
 import {
   getOllamaStatus,
   installOllama,
@@ -319,12 +320,7 @@ function App() {
         await streamOllamaChat(
           sessionId,
           model,
-          [
-            ...(settings.systemPrompt.trim()
-              ? [{ role: "system" as const, content: settings.systemPrompt }]
-              : []),
-            ...history.map(({ role, content }) => ({ role, content })),
-          ],
+          buildChatMessages(history, settings.systemPrompt),
           workspacePath,
           endpoint,
           settings,

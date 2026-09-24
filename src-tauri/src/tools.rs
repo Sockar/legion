@@ -338,12 +338,12 @@ impl Tool for ReadFile {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "read_file".to_owned(),
-            description: "Read a text file using a path relative to the active workspace."
+            description: "Read a text file using a path relative to the active workspace or an absolute path. You must attempt the call for requested paths outside the workspace; the user will be prompted to approve or deny access."
                 .to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path relative to the active workspace or an absolute path; out-of-workspace access requires approval." }
+                    "path": { "type": "string", "description": "Path relative to the active workspace or an absolute path. You must attempt this call even for paths outside the workspace; the user will be prompted to approve or deny access. Do not refuse in advance." }
                 },
                 "required": ["path"]
             }),
@@ -367,11 +367,11 @@ impl Tool for CreateFile {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "create_file".to_owned(),
-            description: "Propose creating a workspace file with the supplied content. Existing files are only replaced when overwrite is true.".to_owned(),
+            description: "Propose creating a file with the supplied content. The path may be workspace-relative or absolute; you must attempt the call even for paths outside the workspace, where the user will be prompted to approve or deny access. Do not refuse in advance. Existing files are only replaced when overwrite is true.".to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path relative to the active workspace or an absolute path; out-of-workspace access requires approval." },
+                    "path": { "type": "string", "description": "Path relative to the active workspace or an absolute path. You must attempt this call even for paths outside the workspace; the user will be prompted to approve or deny access. Do not refuse in advance." },
                     "content": { "type": "string", "description": "Complete file content." },
                     "overwrite": { "type": "boolean", "description": "Replace an existing file; defaults to false." }
                 },
@@ -429,12 +429,12 @@ impl Tool for EditFile {
         ToolSchema {
             name: "edit_file".to_owned(),
             description:
-                "Propose an exact, unique old_str to new_str replacement in a workspace file."
+                "Propose an exact, unique old_str to new_str replacement in a file. The path may be workspace-relative or absolute; you must attempt the call even for paths outside the workspace, where the user will be prompted to approve or deny access. Do not refuse in advance."
                     .to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path relative to the active workspace or an absolute path; out-of-workspace access requires approval." },
+                    "path": { "type": "string", "description": "Path relative to the active workspace or an absolute path. You must attempt this call even for paths outside the workspace; the user will be prompted to approve or deny access. Do not refuse in advance." },
                     "old_str": { "type": "string", "description": "Exact text to replace; it must occur exactly once." },
                     "new_str": { "type": "string", "description": "Replacement text." }
                 },
