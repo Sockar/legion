@@ -113,6 +113,11 @@ export interface ChatChunk {
   done: boolean;
 }
 
+export interface ChatThinkingChunk {
+  request_id: string;
+  thinking: string;
+}
+
 export async function getOllamaStatus(endpoint: string): Promise<ServerStatus> {
   return invoke<ServerStatus>("ollama_status", { endpoint });
 }
@@ -209,6 +214,7 @@ export async function streamOllamaChat(
   endpoint: string,
   settings: ChatSettings,
   onChunk: (chunk: ChatChunk) => void,
+  onThinking: (chunk: ChatThinkingChunk) => void,
   onApproval: (approval: ToolApprovalRequest) => void,
   onToolCall: (event: ToolCallEvent) => void,
   onCommandOutput: (event: CommandOutputEvent) => void,
@@ -219,6 +225,12 @@ export async function streamOllamaChat(
     "ollama://chat-chunk",
     ({ payload }) => {
       if (payload.request_id === requestId) onChunk(payload);
+    },
+  );
+  const unlistenThinking = await listen<ChatThinkingChunk>(
+    "ollama://chat-thinking",
+    ({ payload }) => {
+      if (payload.request_id === requestId) onThinking(payload);
     },
   );
   let unlistenApproval = () => {};
@@ -255,6 +267,7 @@ export async function streamOllamaChat(
         endpoint,
         session_id: sessionId,
         strict_mode: settings.strictMode,
+        enable_reasoning: settings.enableReasoning,
         options: {
           temperature: settings.temperature,
           top_p: settings.topP,
@@ -281,6 +294,7 @@ export async function streamOllamaChat(
   } finally {
     if (onAbort) signal?.removeEventListener("abort", onAbort);
     unlisten();
+    unlistenThinking();
     unlistenApproval();
     unlistenToolCall();
     unlistenCommandOutput();

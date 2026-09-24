@@ -68,6 +68,13 @@ const MIGRATIONS: &[(i64, &str)] = &[
      CREATE INDEX tool_audit_log_session_id_idx
         ON tool_audit_log(session_id, created_at);",
     ),
+    (
+        3,
+        "ALTER TABLE session_settings
+        ADD COLUMN enable_reasoning INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE messages
+        ADD COLUMN reasoning TEXT;",
+    ),
 ];
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -83,6 +90,8 @@ pub struct ChatSettings {
     pub system_prompt: String,
     #[serde(default)]
     pub strict_mode: bool,
+    #[serde(default)]
+    pub enable_reasoning: bool,
 }
 
 impl Default for ChatSettings {
@@ -93,6 +102,7 @@ impl Default for ChatSettings {
             num_ctx: default_num_ctx(),
             system_prompt: String::new(),
             strict_mode: false,
+            enable_reasoning: false,
         }
     }
 }
@@ -107,6 +117,8 @@ pub struct ChatMessage {
     pub created_at: String,
     #[serde(default)]
     pub tool_call_data: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -301,7 +313,8 @@ impl Database {
             let settings = self
                 .connection
                 .query_row(
-                    "SELECT temperature, top_p, num_ctx, system_prompt, strict_mode
+                    "SELECT temperature, top_p, num_ctx, system_prompt, strict_mode,
+                            enable_reasoning
                      FROM session_settings WHERE session_id = ?1",
                     [&id],
                     |row| {
@@ -311,6 +324,7 @@ impl Database {
                             num_ctx: row.get(2)?,
                             system_prompt: row.get(3)?,
                             strict_mode: row.get(4)?,
+                            enable_reasoning: row.get(5)?,
                         })
                     },
                 )
@@ -321,7 +335,7 @@ impl Database {
             let mut message_statement = self
                 .connection
                 .prepare(
-                    "SELECT id, role, content, created_at, tool_call_data
+                    "SELECT id, role, content, created_at, tool_call_data, reasoning
                  FROM messages WHERE session_id = ?1 ORDER BY rowid",
                 )
                 .map_err(storage_error)?;
@@ -338,12 +352,14 @@ impl Database {
                                 Box::new(error),
                             )
                         })?;
+                    let reasoning = row.get(5)?;
                     Ok(ChatMessage {
                         id: row.get(0)?,
                         role: row.get(1)?,
                         content: row.get(2)?,
                         created_at: row.get(3)?,
                         tool_call_data,
+                        reasoning,
                     })
                 })
                 .map_err(storage_error)?;
@@ -475,8 +491,9 @@ fn write_state(transaction: &Transaction<'_>, state: &PersistedSessionState) -> 
         transaction
             .execute(
                 "INSERT INTO session_settings
-                 (session_id, temperature, top_p, num_ctx, system_prompt, strict_mode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (session_id, temperature, top_p, num_ctx, system_prompt, strict_mode,
+                  enable_reasoning)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     session.id,
                     session.settings.temperature,
@@ -484,6 +501,7 @@ fn write_state(transaction: &Transaction<'_>, state: &PersistedSessionState) -> 
                     session.settings.num_ctx,
                     session.settings.system_prompt,
                     session.settings.strict_mode,
+                    session.settings.enable_reasoning,
                 ],
             )
             .map_err(storage_error)?;
@@ -497,14 +515,15 @@ fn write_state(transaction: &Transaction<'_>, state: &PersistedSessionState) -> 
             transaction
                 .execute(
                     "INSERT INTO messages
-                     (id, session_id, role, content, tool_call_data, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (id, session_id, role, content, tool_call_data, reasoning, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         message.id,
                         session.id,
                         message.role,
                         message.content,
                         tool_call_data,
+                        message.reasoning,
                         nonempty_timestamp(&message.created_at),
                     ],
                 )
@@ -691,13 +710,24 @@ mod tests {
                 workspace_path: "C:\\work\\project".to_owned(),
                 created_at: "2026-09-23T12:00:00.000Z".to_owned(),
                 updated_at: "2026-09-23T12:01:00.000Z".to_owned(),
-                messages: vec![ChatMessage {
-                    id: "message-1".to_owned(),
-                    role: "user".to_owned(),
-                    content: "hello".to_owned(),
-                    created_at: "2026-09-23T12:00:30.000Z".to_owned(),
-                    tool_call_data: Some(json!({"tool_calls": []})),
-                }],
+                messages: vec![
+                    ChatMessage {
+                        id: "message-1".to_owned(),
+                        role: "user".to_owned(),
+                        content: "hello".to_owned(),
+                        created_at: "2026-09-23T12:00:30.000Z".to_owned(),
+                        tool_call_data: Some(json!({"tool_calls": []})),
+                        reasoning: None,
+                    },
+                    ChatMessage {
+                        id: "message-2".to_owned(),
+                        role: "assistant".to_owned(),
+                        content: "Hello!".to_owned(),
+                        created_at: "2026-09-23T12:00:35.000Z".to_owned(),
+                        tool_call_data: None,
+                        reasoning: Some("I should greet the user.".to_owned()),
+                    },
+                ],
                 model: "llama3.2".to_owned(),
                 settings: ChatSettings {
                     temperature: 0.4,
@@ -705,6 +735,7 @@ mod tests {
                     num_ctx: 8192,
                     system_prompt: "Be concise".to_owned(),
                     strict_mode: true,
+                    enable_reasoning: true,
                 },
                 archived_at: None,
                 tool_call_history: vec![super::ToolCallHistory {
@@ -740,7 +771,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema tables can be counted");
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert_eq!(table_count, 6);
     }
 

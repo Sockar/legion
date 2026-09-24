@@ -24,12 +24,14 @@ use crate::tools::{
 const DEFAULT_OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 const PULL_PROGRESS_EVENT: &str = "ollama://pull-progress";
 const CHAT_CHUNK_EVENT: &str = "ollama://chat-chunk";
+const CHAT_THINKING_EVENT: &str = "ollama://chat-thinking";
 const TOOL_CALL_EVENT: &str = "tools://tool-call";
 const TOOL_APPROVAL_EVENT: &str = "tools://approval-request";
 const MAX_TOOL_ITERATIONS: usize = 8;
 
 pub type ProgressCallback = Arc<dyn Fn(PullProgress) -> Result<(), String> + Send + Sync>;
 pub type ChatCallback = Arc<dyn Fn(ChatChunk) -> Result<(), String> + Send + Sync>;
+pub type ThinkingCallback = Arc<dyn Fn(ChatThinkingChunk) -> Result<(), String> + Send + Sync>;
 pub type ToolCallCallback = Arc<dyn Fn(ToolCallEvent) -> Result<(), String> + Send + Sync>;
 
 fn emit_pull_progress(
@@ -40,6 +42,16 @@ fn emit_pull_progress(
     progress.request_id = request_id.to_owned();
     emit(PULL_PROGRESS_EVENT, progress)
         .map_err(|error| format!("Could not emit model pull progress: {error}"))
+}
+
+fn emit_chat_thinking(
+    mut chunk: ChatThinkingChunk,
+    request_id: &str,
+    emit: impl FnOnce(&'static str, ChatThinkingChunk) -> Result<(), String>,
+) -> Result<(), String> {
+    chunk.request_id = request_id.to_owned();
+    emit(CHAT_THINKING_EVENT, chunk)
+        .map_err(|error| format!("Could not emit chat reasoning: {error}"))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -152,6 +164,7 @@ pub trait LlmBackend: Send + Sync {
         cancellation: CancellationToken,
         request_id: String,
         on_chunk: ChatCallback,
+        on_thinking: ThinkingCallback,
     ) -> Result<ChatMessage, String>;
 }
 
@@ -270,6 +283,7 @@ impl LlmBackend for OllamaBackend {
         cancellation: CancellationToken,
         request_id: String,
         on_chunk: ChatCallback,
+        on_thinking: ThinkingCallback,
     ) -> Result<ChatMessage, String> {
         request.options.validate()?;
         let endpoint = if request.endpoint.is_empty() {
@@ -277,27 +291,46 @@ impl LlmBackend for OllamaBackend {
         } else {
             request.endpoint.as_str()
         };
+        let api_request = ChatApiRequest {
+            model: request.model.clone(),
+            messages: request.messages.clone(),
+            tools,
+            options: request.options.clone(),
+            think: request.enable_reasoning.then_some(true),
+            stream: true,
+        };
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err("Chat cancelled".to_owned()),
             response = self
                 .client
                 .post(self.api_url(endpoint, "/api/chat")?)
-                .json(&ChatApiRequest {
-                    model: request.model,
-                    messages: request.messages,
-                    tools,
-                    options: request.options,
-                    stream: true,
-                })
+                .json(&api_request)
                 .send() => response.map_err(|error| format!("Could not reach Ollama: {error}"))?,
         };
-        let response = ensure_success(response).await?;
+        let response = match ensure_success(response).await {
+            Ok(response) => response,
+            Err(error) if api_request.think.is_some() && is_thinking_unsupported_error(&error) => {
+                let mut fallback_request = api_request;
+                fallback_request.think = None;
+                let response = tokio::select! {
+                    _ = cancellation.cancelled() => return Err("Chat cancelled".to_owned()),
+                    response = self
+                        .client
+                        .post(self.api_url(endpoint, "/api/chat")?)
+                        .json(&fallback_request)
+                        .send() => response.map_err(|error| format!("Could not reach Ollama: {error}"))?,
+                };
+                ensure_success(response).await?
+            }
+            Err(error) => return Err(error),
+        };
 
         let mut message = ChatMessage {
             role: "assistant".to_owned(),
             content: String::new(),
             tool_calls: None,
             tool_name: None,
+            thinking: String::new(),
         };
         let mut received_message = false;
         read_ndjson_cancellable(response, cancellation.clone(), |line| {
@@ -310,6 +343,13 @@ impl LlmBackend for OllamaBackend {
                         request_id: request_id.clone(),
                         content: part.content,
                         done: false,
+                    })?;
+                }
+                if !part.thinking.is_empty() {
+                    message.thinking.push_str(&part.thinking);
+                    on_thinking(ChatThinkingChunk {
+                        request_id: request_id.clone(),
+                        thinking: part.thinking,
                     })?;
                 }
                 message.role = part.role;
@@ -370,6 +410,8 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub thinking: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -386,6 +428,8 @@ pub struct ChatRequest {
     pub session_id: String,
     #[serde(default)]
     pub strict_mode: bool,
+    #[serde(default)]
+    pub enable_reasoning: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -453,12 +497,14 @@ struct PullRequest {
     name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ChatApiRequest {
     model: String,
     messages: Vec<ChatMessage>,
     tools: Vec<ToolDefinition>,
     options: ChatOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    think: Option<bool>,
     stream: bool,
 }
 
@@ -538,6 +584,10 @@ struct ChatApiResponse {
     message: Option<ChatMessage>,
 }
 
+fn is_thinking_unsupported_error(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("think")
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ServerStatus {
     pub connected: bool,
@@ -561,6 +611,12 @@ pub struct ChatChunk {
     pub request_id: String,
     pub content: String,
     pub done: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ChatThinkingChunk {
+    pub request_id: String,
+    pub thinking: String,
 }
 
 #[derive(Clone, Default)]
@@ -650,6 +706,7 @@ async fn run_tool_loop(
                 cancellation.clone(),
                 request_id.to_owned(),
                 callbacks.on_chunk.clone(),
+                callbacks.on_thinking.clone(),
             )
             .await?;
         if cancellation.is_cancelled() {
@@ -799,6 +856,7 @@ async fn run_tool_loop(
                 content,
                 tool_calls: None,
                 tool_name: Some(call.function.name),
+                thinking: String::new(),
             });
         }
     }
@@ -809,7 +867,8 @@ async fn run_tool_loop(
 struct ToolLoopCallbacks<'a> {
     approval_handler: &'a dyn ApprovalHandler,
     command_output: CommandOutputCallback,
-    on_chunk: &'a ChatCallback,
+    on_chunk: ChatCallback,
+    on_thinking: ThinkingCallback,
     on_tool_call: &'a ToolCallCallback,
 }
 
@@ -949,6 +1008,15 @@ pub async fn ollama_chat(
             .emit(CHAT_CHUNK_EVENT, chunk)
             .map_err(|error| format!("Could not emit chat response: {error}"))
     });
+    let thinking_request_id = request_id.clone();
+    let thinking_app = app.clone();
+    let on_thinking: ThinkingCallback = Arc::new(move |chunk| {
+        emit_chat_thinking(chunk, &thinking_request_id, |event, chunk| {
+            thinking_app
+                .emit(event, chunk)
+                .map_err(|error| error.to_string())
+        })
+    });
     let approval_handler = TauriApprovalHandler {
         app: app.clone(),
         pending: backend.pending_approvals.clone(),
@@ -989,7 +1057,8 @@ pub async fn ollama_chat(
         ToolLoopCallbacks {
             approval_handler: &approval_handler,
             command_output,
-            on_chunk: &on_chunk,
+            on_chunk,
+            on_thinking,
             on_tool_call: &on_tool_call,
         },
     )
@@ -1106,12 +1175,12 @@ impl NdjsonBuffer {
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_pull_progress, normalize_endpoint, parse_ndjson_line, run_tool_loop,
-        with_download_cancellation, ApprovalHandler, BackendState, ChatApiRequest, ChatApiResponse,
-        ChatCallback, ChatChunk, ChatMessage, ChatOptions, ChatRequest, LlmBackend, ModelInfo,
-        NdjsonBuffer, OllamaBackend, OllamaPullProgress, PullProgress, PullProgressAggregator,
-        ServerStatus, ToolApprovalRequest, ToolCallCallback, ToolLoopCallbacks,
-        MAX_TOOL_ITERATIONS,
+        emit_chat_thinking, emit_pull_progress, normalize_endpoint, parse_ndjson_line,
+        run_tool_loop, with_download_cancellation, ApprovalHandler, BackendState, ChatApiRequest,
+        ChatApiResponse, ChatCallback, ChatChunk, ChatMessage, ChatOptions, ChatRequest,
+        ChatThinkingChunk, LlmBackend, ModelInfo, NdjsonBuffer, OllamaBackend, OllamaPullProgress,
+        PullProgress, PullProgressAggregator, ServerStatus, ThinkingCallback, ToolApprovalRequest,
+        ToolCallCallback, ToolLoopCallbacks, MAX_TOOL_ITERATIONS,
     };
     use crate::tools::{
         CommandOutputCallback, RiskLevel, Tool, ToolCall, ToolContext, ToolDefinition,
@@ -1199,6 +1268,213 @@ mod tests {
         assert_eq!(progress.request_id, "request-1");
         assert_eq!(progress.name, "llama3.1:8b");
         assert_eq!(progress.percentage, Some(25));
+    }
+
+    #[test]
+    fn emits_chat_thinking_with_the_request_id() {
+        let mut emitted = None;
+        emit_chat_thinking(
+            ChatThinkingChunk {
+                request_id: String::new(),
+                thinking: "reasoning delta".to_owned(),
+            },
+            "request-1",
+            |event, chunk| {
+                emitted = Some((event, chunk));
+                Ok(())
+            },
+        )
+        .expect("thinking event is emitted");
+
+        let (event, chunk) = emitted.expect("emitter receives the event");
+        assert_eq!(event, super::CHAT_THINKING_EVENT);
+        assert_eq!(chunk.request_id, "request-1");
+        assert_eq!(chunk.thinking, "reasoning delta");
+    }
+
+    #[tokio::test]
+    async fn streams_thinking_separately_from_chat_content() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local HTTP listener starts");
+        let address = listener
+            .local_addr()
+            .expect("listener address is available");
+        let response_body = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"thinking\":\"Let me consider. \",\"content\":\"\"}}\n",
+            "{\"message\":{\"role\":\"assistant\",\"thinking\":\"Now answer.\",\"content\":\"42\"}}\n",
+            "{\"done\":true}\n"
+        );
+        let server_body = response_body.to_owned();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("request is accepted");
+            let request = read_http_request(&mut stream).await;
+            let request: Value =
+                serde_json::from_slice(request_body(&request)).expect("request is JSON");
+            assert_eq!(request["think"], true);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                server_body.len(),
+                server_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("response is written");
+        });
+
+        let backend = OllamaBackend::new(format!("http://{address}"));
+        let mut request = chat_request();
+        request.endpoint = format!("http://{address}");
+        request.enable_reasoning = true;
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let thinking_chunks = Arc::new(Mutex::new(Vec::new()));
+        let captured_chunks = chunks.clone();
+        let captured_thinking = thinking_chunks.clone();
+        let message = backend
+            .chat(
+                request,
+                Vec::new(),
+                CancellationToken::new(),
+                "request-1".to_owned(),
+                Arc::new(move |chunk| {
+                    captured_chunks.lock().unwrap().push(chunk);
+                    Ok(())
+                }),
+                Arc::new(move |chunk| {
+                    captured_thinking.lock().unwrap().push(chunk);
+                    Ok(())
+                }),
+            )
+            .await
+            .expect("chat response is parsed");
+        server.await.expect("server completes");
+
+        assert_eq!(message.content, "42");
+        assert_eq!(message.thinking, "Let me consider. Now answer.");
+        assert_eq!(
+            chunks
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|chunk| chunk.content.as_str())
+                .collect::<String>(),
+            "42"
+        );
+        let thinking_chunks = thinking_chunks.lock().unwrap();
+        assert_eq!(thinking_chunks.len(), 2);
+        assert!(thinking_chunks
+            .iter()
+            .all(|chunk| chunk.request_id == "request-1"));
+        assert_eq!(
+            thinking_chunks
+                .iter()
+                .map(|chunk| chunk.thinking.as_str())
+                .collect::<String>(),
+            "Let me consider. Now answer."
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_without_thinking_when_the_server_rejects_think() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local HTTP listener starts");
+        let address = listener
+            .local_addr()
+            .expect("listener address is available");
+        let server = tokio::spawn(async move {
+            let (mut first_stream, _) = listener.accept().await.expect("first request is accepted");
+            let first_request = read_http_request(&mut first_stream).await;
+            let first_request: Value =
+                serde_json::from_slice(request_body(&first_request)).expect("request is JSON");
+            assert_eq!(first_request["think"], true);
+            let body = r#"{"error":"model does not support thinking"}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            first_stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("unsupported-thinking response is written");
+            drop(first_stream);
+
+            let (mut second_stream, _) = listener
+                .accept()
+                .await
+                .expect("fallback request is accepted");
+            let fallback_request = read_http_request(&mut second_stream).await;
+            let fallback_request: Value = serde_json::from_slice(request_body(&fallback_request))
+                .expect("fallback request is JSON");
+            assert!(fallback_request.get("think").is_none());
+            let body = "{\"message\":{\"role\":\"assistant\",\"content\":\"answer\"}}\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            second_stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("fallback chat response is written");
+        });
+
+        let backend = OllamaBackend::new(format!("http://{address}"));
+        let mut request = chat_request();
+        request.endpoint = format!("http://{address}");
+        request.enable_reasoning = true;
+        let message = backend
+            .chat(
+                request,
+                Vec::new(),
+                CancellationToken::new(),
+                "request-1".to_owned(),
+                Arc::new(|_| Ok(())),
+                Arc::new(|_| Ok(())),
+            )
+            .await
+            .expect("unsupported reasoning falls back to regular chat");
+        server.await.expect("server completes");
+        assert_eq!(message.content, "answer");
+        assert!(message.thinking.is_empty());
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 4096];
+            let bytes_read = stream.read(&mut buffer).await.expect("request is read");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..bytes_read]);
+            if let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("valid content length"))
+                    })
+                    .unwrap_or_default();
+                if request.len() >= headers_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        request
+    }
+
+    fn request_body(request: &[u8]) -> &[u8] {
+        let body_start = request
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .expect("request has headers")
+            + 4;
+        &request[body_start..]
     }
 
     #[tokio::test]
@@ -1356,12 +1632,25 @@ mod tests {
                 top_p: 0.8,
                 num_ctx: 8192,
             },
+            think: Some(true),
             stream: true,
         };
         let value = serde_json::to_value(request).expect("request serializes");
         assert_eq!(value["options"]["temperature"], 0.4);
         assert_eq!(value["options"]["top_p"], 0.8);
         assert_eq!(value["options"]["num_ctx"], 8192);
+        assert_eq!(value["think"], true);
+        assert_eq!(
+            serde_json::to_value(ChatMessage {
+                role: "assistant".to_owned(),
+                content: "answer".to_owned(),
+                tool_calls: None,
+                tool_name: None,
+                thinking: "private reasoning".to_owned(),
+            })
+            .expect("message serializes")["thinking"],
+            Value::Null
+        );
     }
 
     struct MockBackend {
@@ -1409,6 +1698,7 @@ mod tests {
             _cancellation: CancellationToken,
             request_id: String,
             on_chunk: ChatCallback,
+            on_thinking: ThinkingCallback,
         ) -> Result<ChatMessage, String> {
             self.requests.lock().unwrap().push(request);
             let message = self
@@ -1419,9 +1709,15 @@ mod tests {
                 .ok_or_else(|| "No mock response left".to_owned())?;
             if !message.content.is_empty() {
                 on_chunk(ChatChunk {
-                    request_id,
+                    request_id: request_id.clone(),
                     content: message.content.clone(),
                     done: false,
+                })?;
+            }
+            if !message.thinking.is_empty() {
+                on_thinking(ChatThinkingChunk {
+                    request_id,
+                    thinking: message.thinking.clone(),
                 })?;
             }
             Ok(message)
@@ -1487,6 +1783,7 @@ mod tests {
                 },
             }]),
             tool_name: None,
+            thinking: String::new(),
         }
     }
 
@@ -1496,6 +1793,7 @@ mod tests {
             content: "done".to_owned(),
             tool_calls: None,
             tool_name: None,
+            thinking: String::new(),
         }
     }
 
@@ -1507,11 +1805,13 @@ mod tests {
             options: super::ChatOptions::default(),
             session_id: "session".to_owned(),
             strict_mode: false,
+            enable_reasoning: false,
             messages: vec![ChatMessage {
                 role: "user".to_owned(),
                 content: "run it".to_owned(),
                 tool_calls: None,
                 tool_name: None,
+                thinking: String::new(),
             }],
         }
     }
@@ -1560,7 +1860,8 @@ mod tests {
             ToolLoopCallbacks {
                 approval_handler: &approval,
                 command_output: command_output_callback(),
-                on_chunk: &on_chunk,
+                on_chunk: on_chunk.clone(),
+                on_thinking: Arc::new(|_| Ok(())),
                 on_tool_call: &tool_call_callback(),
             },
         )
@@ -1618,7 +1919,8 @@ mod tests {
             ToolLoopCallbacks {
                 approval_handler: &approval,
                 command_output: command_output_callback(),
-                on_chunk: &on_chunk,
+                on_chunk: on_chunk.clone(),
+                on_thinking: Arc::new(|_| Ok(())),
                 on_tool_call: &tool_call_callback(),
             },
         )
@@ -1672,7 +1974,8 @@ mod tests {
             ToolLoopCallbacks {
                 approval_handler: &approval,
                 command_output: command_output_callback(),
-                on_chunk: &on_chunk,
+                on_chunk: on_chunk.clone(),
+                on_thinking: Arc::new(|_| Ok(())),
                 on_tool_call: &on_tool_call,
             },
         )
@@ -1721,7 +2024,8 @@ mod tests {
             ToolLoopCallbacks {
                 approval_handler: &approval,
                 command_output: command_output_callback(),
-                on_chunk: &on_chunk,
+                on_chunk: on_chunk.clone(),
+                on_thinking: Arc::new(|_| Ok(())),
                 on_tool_call: &tool_call_callback(),
             },
         )
@@ -1756,7 +2060,8 @@ mod tests {
             ToolLoopCallbacks {
                 approval_handler: &approval,
                 command_output: command_output_callback(),
-                on_chunk: &on_chunk,
+                on_chunk: on_chunk.clone(),
+                on_thinking: Arc::new(|_| Ok(())),
                 on_tool_call: &tool_call_callback(),
             },
         )

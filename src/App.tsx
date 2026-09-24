@@ -306,7 +306,9 @@ function App() {
         updateSessionTimestamp({
           ...session,
           messages: session.messages.map((message) =>
-            message.id === assistantId ? { ...message, content: "" } : message,
+            message.id === assistantId
+              ? { ...message, content: "", reasoning: undefined }
+              : message,
           ),
         }),
       );
@@ -331,6 +333,21 @@ function App() {
                 messages: session.messages.map((message) =>
                   message.id === assistantId
                     ? { ...message, content: message.content + content }
+                    : message,
+                ),
+              }),
+            );
+          },
+          ({ thinking }) => {
+            updateSession(sessionId, (session) =>
+              updateSessionTimestamp({
+                ...session,
+                messages: session.messages.map((message) =>
+                  message.id === assistantId
+                    ? {
+                        ...message,
+                        reasoning: (message.reasoning ?? "") + thinking,
+                      }
                     : message,
                 ),
               }),
