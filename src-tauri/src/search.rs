@@ -753,12 +753,13 @@ mod tests {
     }
 
     fn context(workspace: PathBuf) -> ToolContext {
-        ToolContext {
+        ToolContext::new(
             workspace,
-            request_id: "test-request".to_owned(),
-            command_id: "test-command".to_owned(),
-            command_output: None,
-        }
+            "test-request".to_owned(),
+            "test-command".to_owned(),
+            None,
+            None,
+        )
     }
 
     fn chunk(path: &str, embedding: Vec<f32>) -> EmbeddedChunk {

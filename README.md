@@ -27,12 +27,19 @@ dispatches Ollama tool calls, returns results (including failures) to the model,
 and continues for up to eight tool iterations. Tools declare `auto_approve` or
 `requires_confirmation`; the latter prompts the user in the app before running.
 The initial read-only examples are `get_current_time` and
-`list_workspace_files`; workspace-scoped `read_file`, `create_file`, and
-`edit_file` tools are also available. File tools resolve paths under the active
-session's workspace and reject paths that escape it. Creates fail for existing
-files unless `overwrite` is explicitly true. Edits use an exact `old_str` to
+`list_workspace_files`; `read_file`, `create_file`, and `edit_file` tools are
+also available. File tools accept workspace-relative or absolute paths and
+resolve them against the active session's workspace.
+Creates fail for existing files unless `overwrite` is explicitly true. Edits
+use an exact `old_str` to
 `new_str` replacement and reject missing or ambiguous matches. File mutations
-require approval and show a highlighted diff in the chat before writing.
+require approval and show a highlighted diff in the chat before writing. When
+a file tool requests an out-of-workspace path, Legion displays the canonical
+path and asks whether to allow it once, always, or deny it. "Always allow"
+stores the canonical containing directory (or the requested directory) in the
+local SQLite trusted-paths table; subsequent access beneath it is authorized
+without another prompt.
+These approvals are recorded in the local tool audit log.
 The high-risk `run_command` tool also requires confirmation and displays the
 exact command before execution. A first-layer deny-list in
 `src-tauri/src/security.rs` rejects selected destructive command patterns before
@@ -47,9 +54,12 @@ These controls are defense in depth, not a full OS-level sandbox. The command
 deny-list is intentionally incomplete and can be bypassed by unlisted commands,
 scripts, or command interpreters; approved shell commands can still access
 files outside the workspace. Workspace path validation canonicalizes paths and
-checks symlinks, but cannot eliminate filesystem race conditions. Use strict
-mode when you want to review every tool invocation, and do not run Legion with
-privileges you would not grant to the agent.
+checks symlinks, and requests explicit approval before file tools can follow a
+path outside the workspace;
+it cannot eliminate filesystem race conditions. Trusted-path grants apply only
+to file tools and never change the `run_command` deny-list. Use strict mode when
+you want to review every tool invocation, and do not run Legion with privileges
+you would not grant to the agent.
 New tools implement the Rust `Tool` trait and can be registered on
 `BackendState` before it is shared.
 

@@ -1,9 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -19,7 +19,7 @@ use tokio::{
 use crate::{
     search::{GlobSearch, GrepSearch, IndexWorkspace, SemanticSearch},
     security::blocked_command_reason,
-    workspace::resolve_workspace_path,
+    workspace::{resolve_path_candidate, resolve_workspace_path},
 };
 
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 60_000;
@@ -37,6 +37,75 @@ pub struct ToolContext {
     pub request_id: String,
     pub command_id: String,
     pub command_output: Option<CommandOutputCallback>,
+    pub out_of_workspace_approver: Option<Arc<dyn OutOfWorkspaceApprover>>,
+    approved_outside_paths: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    AllowOnce,
+    AllowAlways,
+    Deny,
+}
+
+#[async_trait]
+pub trait OutOfWorkspaceApprover: Send + Sync {
+    async fn approve_path(&self, path: &Path) -> Result<ApprovalDecision, String>;
+}
+
+impl ToolContext {
+    pub fn new(
+        workspace: PathBuf,
+        request_id: String,
+        command_id: String,
+        command_output: Option<CommandOutputCallback>,
+        out_of_workspace_approver: Option<Arc<dyn OutOfWorkspaceApprover>>,
+    ) -> Self {
+        Self {
+            workspace,
+            request_id,
+            command_id,
+            command_output,
+            out_of_workspace_approver,
+            approved_outside_paths: Arc::default(),
+        }
+    }
+
+    pub async fn resolve_path(
+        &self,
+        requested_path: &Path,
+        require_existing: bool,
+    ) -> Result<PathBuf, String> {
+        let (root, resolved) =
+            resolve_path_candidate(&self.workspace, requested_path, require_existing)?;
+        if resolved.starts_with(&root) {
+            return Ok(resolved);
+        }
+
+        let already_approved = self
+            .approved_outside_paths
+            .lock()
+            .map_err(|error| format!("Could not check approved paths: {error}"))?
+            .contains(&resolved);
+        if already_approved {
+            return Ok(resolved);
+        }
+        let approver = self
+            .out_of_workspace_approver
+            .as_ref()
+            .ok_or_else(|| "Path escapes the workspace folder".to_owned())?;
+        match approver.approve_path(&resolved).await? {
+            ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways => {
+                self.approved_outside_paths
+                    .lock()
+                    .map_err(|error| format!("Could not record approved path: {error}"))?
+                    .insert(resolved.clone());
+                Ok(resolved)
+            }
+            ApprovalDecision::Deny => Err("User denied access to the requested path".to_owned()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -241,7 +310,7 @@ impl Tool for ListWorkspaceFiles {
     }
 
     async fn call(&self, _arguments: Value, context: ToolContext) -> Result<Value, String> {
-        let workspace = resolve_workspace_path(&context.workspace, Path::new("."), true)?;
+        let workspace = context.resolve_path(Path::new("."), true).await?;
         let entries = fs::read_dir(&workspace)
             .map_err(|error| format!("Could not list workspace: {error}"))?;
         let mut files = entries
@@ -274,7 +343,7 @@ impl Tool for ReadFile {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Workspace-relative file path." }
+                    "path": { "type": "string", "description": "Path relative to the active workspace or an absolute path; out-of-workspace access requires approval." }
                 },
                 "required": ["path"]
             }),
@@ -284,7 +353,7 @@ impl Tool for ReadFile {
 
     async fn call(&self, arguments: Value, context: ToolContext) -> Result<Value, String> {
         let relative_path = argument_string(&arguments, "path")?;
-        let path = resolve_workspace_path(&context.workspace, Path::new(relative_path), true)?;
+        let path = context.resolve_path(Path::new(relative_path), true).await?;
         let content = fs::read_to_string(&path)
             .map_err(|error| format!("Could not read {relative_path}: {error}"))?;
         Ok(json!({ "path": relative_path, "content": content }))
@@ -302,7 +371,7 @@ impl Tool for CreateFile {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Workspace-relative file path." },
+                    "path": { "type": "string", "description": "Path relative to the active workspace or an absolute path; out-of-workspace access requires approval." },
                     "content": { "type": "string", "description": "Complete file content." },
                     "overwrite": { "type": "boolean", "description": "Replace an existing file; defaults to false." }
                 },
@@ -317,7 +386,7 @@ impl Tool for CreateFile {
         arguments: Value,
         context: ToolContext,
     ) -> Result<Option<Value>, String> {
-        let (relative_path, before, after) = create_file_change(&arguments, &context.workspace)?;
+        let (relative_path, before, after) = create_file_change(&arguments, &context).await?;
         Ok(Some(json!({
             "operation": "create",
             "path": relative_path,
@@ -327,10 +396,10 @@ impl Tool for CreateFile {
     }
 
     async fn call(&self, arguments: Value, context: ToolContext) -> Result<Value, String> {
-        let (relative_path, before, content) = create_file_change(&arguments, &context.workspace)?;
+        let (relative_path, before, content) = create_file_change(&arguments, &context).await?;
         ensure_approved_snapshot(&arguments, &before)?;
         let overwrite = argument_bool(&arguments, "overwrite", false)?;
-        let path = resolve_workspace_path(&context.workspace, &relative_path, false)?;
+        let path = context.resolve_path(&relative_path, false).await?;
         if overwrite {
             fs::write(&path, content)
                 .map_err(|error| format!("Could not write {}: {error}", relative_path.display()))?;
@@ -365,7 +434,7 @@ impl Tool for EditFile {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Workspace-relative file path." },
+                    "path": { "type": "string", "description": "Path relative to the active workspace or an absolute path; out-of-workspace access requires approval." },
                     "old_str": { "type": "string", "description": "Exact text to replace; it must occur exactly once." },
                     "new_str": { "type": "string", "description": "Replacement text." }
                 },
@@ -380,7 +449,7 @@ impl Tool for EditFile {
         arguments: Value,
         context: ToolContext,
     ) -> Result<Option<Value>, String> {
-        let (relative_path, before, after) = edit_file_change(&arguments, &context.workspace)?;
+        let (relative_path, before, after) = edit_file_change(&arguments, &context).await?;
         Ok(Some(json!({
             "operation": "edit",
             "path": relative_path,
@@ -390,9 +459,9 @@ impl Tool for EditFile {
     }
 
     async fn call(&self, arguments: Value, context: ToolContext) -> Result<Value, String> {
-        let (relative_path, before, after) = edit_file_change(&arguments, &context.workspace)?;
+        let (relative_path, before, after) = edit_file_change(&arguments, &context).await?;
         ensure_approved_snapshot(&arguments, &before)?;
-        let path = resolve_workspace_path(&context.workspace, &relative_path, true)?;
+        let path = context.resolve_path(&relative_path, true).await?;
         fs::write(&path, after)
             .map_err(|error| format!("Could not write {}: {error}", relative_path.display()))?;
         Ok(json!({ "path": relative_path, "edited": true }))
@@ -427,14 +496,14 @@ fn argument_bool(arguments: &Value, key: &str, default: bool) -> Result<bool, St
     }
 }
 
-fn create_file_change(
+async fn create_file_change(
     arguments: &Value,
-    workspace: &Path,
+    context: &ToolContext,
 ) -> Result<(PathBuf, String, String), String> {
     let relative_path = PathBuf::from(argument_string(arguments, "path")?);
     let content = argument_string(arguments, "content")?.to_owned();
     let overwrite = argument_bool(arguments, "overwrite", false)?;
-    let path = resolve_workspace_path(workspace, &relative_path, false)?;
+    let path = context.resolve_path(&relative_path, false).await?;
     let before = if path.exists() {
         if !overwrite {
             return Err(format!(
@@ -450,9 +519,9 @@ fn create_file_change(
     Ok((relative_path, before, content))
 }
 
-fn edit_file_change(
+async fn edit_file_change(
     arguments: &Value,
-    workspace: &Path,
+    context: &ToolContext,
 ) -> Result<(PathBuf, String, String), String> {
     let relative_path = PathBuf::from(argument_string(arguments, "path")?);
     let old_str = argument_string(arguments, "old_str")?;
@@ -460,7 +529,7 @@ fn edit_file_change(
     if old_str.is_empty() {
         return Err("old_str cannot be empty; provide specific context to replace".to_owned());
     }
-    let path = resolve_workspace_path(workspace, &relative_path, true)?;
+    let path = context.resolve_path(&relative_path, true).await?;
     let before = fs::read_to_string(&path)
         .map_err(|error| format!("Could not read {}: {error}", relative_path.display()))?;
     let start = before
@@ -824,11 +893,15 @@ fn captured_output_text(output: Vec<u8>) -> String {
 mod tests {
     use super::{
         append_limited, edit_file_change, read_output, resolve_workspace_path, run_command,
-        RiskLevel, Tool, ToolContext, ToolRegistry, ToolSchema, MAX_CAPTURED_OUTPUT_BYTES,
+        ApprovalDecision, OutOfWorkspaceApprover, RiskLevel, RunCommand, Tool, ToolContext,
+        ToolRegistry, ToolSchema, MAX_CAPTURED_OUTPUT_BYTES,
     };
     use async_trait::async_trait;
     use serde_json::{json, Value};
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -837,6 +910,19 @@ mod tests {
     use tokio::{io::AsyncWriteExt, time::timeout};
 
     struct TestTool(&'static str);
+
+    struct FixedPathApprover {
+        decision: ApprovalDecision,
+        requests: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl OutOfWorkspaceApprover for FixedPathApprover {
+        async fn approve_path(&self, _path: &Path) -> Result<ApprovalDecision, String> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            Ok(self.decision)
+        }
+    }
 
     #[async_trait]
     impl Tool for TestTool {
@@ -876,6 +962,19 @@ mod tests {
         path
     }
 
+    fn test_context(
+        workspace: PathBuf,
+        approver: Option<Arc<dyn OutOfWorkspaceApprover>>,
+    ) -> ToolContext {
+        ToolContext::new(
+            workspace,
+            "request".to_owned(),
+            "call".to_owned(),
+            None,
+            approver,
+        )
+    }
+
     #[test]
     fn rejects_paths_that_escape_workspace() {
         let root = temporary_workspace();
@@ -889,42 +988,109 @@ mod tests {
         fs::remove_dir_all(root).expect("temporary workspace is removed");
     }
 
-    #[test]
-    fn edit_requires_one_non_empty_exact_match() {
+    #[tokio::test]
+    async fn edit_requires_one_non_empty_exact_match() {
         let workspace = temporary_workspace();
         fs::write(workspace.join("example.txt"), "one target, then target").expect("file written");
+        let context = test_context(workspace.clone(), None);
 
         let missing = edit_file_change(
             &json!({ "path": "example.txt", "old_str": "missing", "new_str": "new" }),
-            &workspace,
-        );
+            &context,
+        )
+        .await;
         assert!(missing.unwrap_err().contains("not found"));
 
         let ambiguous = edit_file_change(
             &json!({ "path": "example.txt", "old_str": "target", "new_str": "new" }),
-            &workspace,
-        );
+            &context,
+        )
+        .await;
         assert!(ambiguous.unwrap_err().contains("multiple times"));
 
         let empty = edit_file_change(
             &json!({ "path": "example.txt", "old_str": "", "new_str": "new" }),
-            &workspace,
-        );
+            &context,
+        )
+        .await;
         assert!(empty.unwrap_err().contains("cannot be empty"));
 
         let unique = edit_file_change(
             &json!({ "path": "example.txt", "old_str": "one target", "new_str": "a target" }),
-            &workspace,
+            &context,
         )
+        .await
         .expect("unique replacement succeeds");
         assert_eq!(unique.2, "a target, then target");
 
         fs::write(workspace.join("example.txt"), "aaa").expect("overlap case is written");
         let overlapping = edit_file_change(
             &json!({ "path": "example.txt", "old_str": "aa", "new_str": "b" }),
-            &workspace,
-        );
+            &context,
+        )
+        .await;
         assert!(overlapping.unwrap_err().contains("multiple times"));
+        fs::remove_dir_all(workspace).expect("temporary workspace is removed");
+    }
+
+    #[tokio::test]
+    async fn out_of_workspace_paths_request_all_three_decisions() {
+        let root = temporary_workspace();
+        let workspace = root.join("workspace");
+        let outside_file = root.join("outside.txt");
+        fs::create_dir(&workspace).expect("workspace is created");
+        fs::write(&outside_file, "outside").expect("outside file is written");
+
+        for (decision, expected_error) in [
+            (ApprovalDecision::AllowOnce, false),
+            (ApprovalDecision::AllowAlways, false),
+            (ApprovalDecision::Deny, true),
+        ] {
+            let approver = Arc::new(FixedPathApprover {
+                decision,
+                requests: AtomicUsize::new(0),
+            });
+            let context = test_context(workspace.clone(), Some(approver.clone()));
+            let result = context
+                .resolve_path(Path::new("../outside.txt"), true)
+                .await;
+            assert_eq!(result.is_err(), expected_error);
+            if !expected_error {
+                assert_eq!(
+                    result.expect("approval grants access"),
+                    fs::canonicalize(&outside_file).expect("outside file canonicalizes")
+                );
+                context
+                    .resolve_path(Path::new("../outside.txt"), true)
+                    .await
+                    .expect("same tool invocation reuses its path approval");
+            }
+            assert_eq!(approver.requests.load(Ordering::SeqCst), 1);
+        }
+
+        let context = test_context(workspace, None);
+        assert!(context
+            .resolve_path(Path::new("../outside.txt"), true)
+            .await
+            .unwrap_err()
+            .contains("escapes the workspace"));
+        fs::remove_dir_all(root).expect("temporary workspace is removed");
+    }
+
+    #[tokio::test]
+    async fn trusted_path_approval_does_not_bypass_run_command_deny_list() {
+        let workspace = temporary_workspace();
+        let approver = Arc::new(FixedPathApprover {
+            decision: ApprovalDecision::AllowAlways,
+            requests: AtomicUsize::new(0),
+        });
+        let context = test_context(workspace.clone(), Some(approver.clone()));
+        let result = RunCommand
+            .call(json!({ "command": "rm -rf /" }), context)
+            .await
+            .expect_err("dangerous command remains blocked");
+        assert!(result.contains("blocklist"));
+        assert_eq!(approver.requests.load(Ordering::SeqCst), 0);
         fs::remove_dir_all(workspace).expect("temporary workspace is removed");
     }
 

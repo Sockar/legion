@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { FileChangeReview } from "./components/FileChangeReview";
 import { ChatInput } from "./components/ChatInput";
 import { MessageList } from "./components/MessageList";
+import { OutOfWorkspaceApproval } from "./components/OutOfWorkspaceApproval";
 import {
   DownloadProgress,
   type DownloadFeedback,
@@ -27,6 +28,7 @@ import {
   type PullProgress,
   type ServerStatus,
   type ToolApprovalRequest,
+  type ApprovalDecision,
 } from "./lib/ollama";
 import type { ChatMessage } from "./types/chat";
 import {
@@ -611,11 +613,11 @@ function App() {
   }, [activeSession]);
 
   const handleToolApproval = useCallback(
-    async (approved: boolean) => {
+    async (decision: ApprovalDecision) => {
       if (!currentToolApproval || resolvingApprovalId) return;
       setResolvingApprovalId(currentToolApproval.approval_id);
       try {
-        await respondToToolApproval(currentToolApproval.approval_id, approved);
+        await respondToToolApproval(currentToolApproval.approval_id, decision);
         setToolApprovals((current) =>
           current.filter(
             (pending) =>
@@ -1079,18 +1081,28 @@ function App() {
             aria-labelledby="tool-approval-title"
           >
             <h2 id="tool-approval-title">
-              {currentToolApproval.preview
-                ? "Review proposed file change"
-                : "Allow tool execution?"}
+              {currentToolApproval.approval_type === "out_of_workspace_access"
+                ? "Allow access outside the workspace?"
+                : currentToolApproval.preview
+                  ? "Review proposed file change"
+                  : "Allow tool execution?"}
             </h2>
-            {currentToolApproval.preview ? (
+            {currentToolApproval.approval_type === "out_of_workspace_access" ? (
+              <OutOfWorkspaceApproval
+                path={currentToolApproval.requested_path ?? ""}
+                disabled={
+                  resolvingApprovalId === currentToolApproval.approval_id
+                }
+                onDecision={(decision) => void handleToolApproval(decision)}
+              />
+            ) : currentToolApproval.preview ? (
               <FileChangeReview
                 preview={currentToolApproval.preview}
                 disabled={
                   resolvingApprovalId === currentToolApproval.approval_id
                 }
-                onAccept={() => void handleToolApproval(true)}
-                onReject={() => void handleToolApproval(false)}
+                onAccept={() => void handleToolApproval("allow_once")}
+                onReject={() => void handleToolApproval("deny")}
               />
             ) : (
               <>
@@ -1116,7 +1128,7 @@ function App() {
                     disabled={
                       resolvingApprovalId === currentToolApproval.approval_id
                     }
-                    onClick={() => void handleToolApproval(false)}
+                    onClick={() => void handleToolApproval("deny")}
                   >
                     Deny
                   </button>
@@ -1126,7 +1138,7 @@ function App() {
                     disabled={
                       resolvingApprovalId === currentToolApproval.approval_id
                     }
-                    onClick={() => void handleToolApproval(true)}
+                    onClick={() => void handleToolApproval("allow_once")}
                   >
                     Allow once
                   </button>
@@ -1197,8 +1209,8 @@ function App() {
                   disabled={
                     resolvingApprovalId === inlineFileApproval.approval_id
                   }
-                  onAccept={() => void handleToolApproval(true)}
-                  onReject={() => void handleToolApproval(false)}
+                  onAccept={() => void handleToolApproval("allow_once")}
+                  onReject={() => void handleToolApproval("deny")}
                 />
               )}
               <div ref={bottomRef} />

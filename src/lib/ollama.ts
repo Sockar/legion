@@ -56,7 +56,11 @@ export interface ToolApprovalRequest {
     before: string;
     after: string;
   } | null;
+  approval_type?: "out_of_workspace_access";
+  requested_path?: string;
 }
+
+export type ApprovalDecision = "allow_once" | "allow_always" | "deny";
 
 export interface CommandOutputEvent {
   request_id: string;
@@ -303,7 +307,7 @@ export async function streamOllamaChat(
 
 export async function respondToToolApproval(
   approvalId: string,
-  approved: boolean,
+  decision: ApprovalDecision,
 ): Promise<void> {
-  await invoke("respond_tool_approval", { approvalId, approved });
+  await invoke("respond_tool_approval", { approvalId, decision });
 }
