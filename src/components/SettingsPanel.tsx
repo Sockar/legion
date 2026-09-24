@@ -12,6 +12,10 @@ import {
 import type { ModelInfo, ServerStatus } from "../lib/ollama";
 import { ModelPicker } from "./ModelPicker";
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
 interface SettingsPanelProps {
   activeSession: ChatSession | null;
   endpoint: string;
@@ -125,16 +129,22 @@ export function SettingsPanel({
         setTestStatus(await onTestConnection(endpointDraft.trim()));
       }
     } catch (error) {
+      if (isAbortError(error)) {
+        setTestError("");
+        return;
+      }
       setTestError(error instanceof Error ? error.message : String(error));
       if (autoInstallEnabled) {
-        await onInstallOllama(endpointDraft.trim());
         try {
+          await onInstallOllama(endpointDraft.trim());
           setTestStatus(await onTestConnection(endpointDraft.trim()));
         } catch (retryError) {
           setTestError(
-            retryError instanceof Error
-              ? retryError.message
-              : String(retryError),
+            isAbortError(retryError)
+              ? ""
+              : retryError instanceof Error
+                ? retryError.message
+                : String(retryError),
           );
         }
       }

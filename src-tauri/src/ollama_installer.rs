@@ -4,18 +4,21 @@ use std::{
     time::Duration,
 };
 
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use reqwest::{header::ACCEPT, Client, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use tauri::Manager;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, State};
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
     process::Command,
 };
+use tokio_util::sync::CancellationToken;
+
+use crate::ollama::{with_download_cancellation, BackendState};
 
 const RELEASE_API: &str = "https://api.github.com/repos/ollama/ollama/releases/latest";
 const MAX_DOWNLOAD_BYTES: u64 = 3 * 1024 * 1024 * 1024;
@@ -196,15 +199,19 @@ async fn download_release_asset(
     target: InstallerTarget,
     asset: &ReleaseAsset,
     destination: &Path,
+    cancellation: CancellationToken,
 ) -> Result<bool, String> {
+    if cancellation.is_cancelled() {
+        return Err("Installation cancelled".to_owned());
+    }
     let url = validate_release_asset(target, asset)?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| format!("Could not download Ollama: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("Could not download Ollama: {error}"))?;
+    let response = tokio::select! {
+        _ = cancellation.cancelled() => return Err("Installation cancelled".to_owned()),
+        response = client.get(url).send() => response
+            .map_err(|error| format!("Could not download Ollama: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("Could not download Ollama: {error}"))?,
+    };
     let final_url = response.url();
     if final_url.scheme() != "https"
         || !matches!(
@@ -238,7 +245,7 @@ async fn download_release_asset(
     let mut file = File::create(destination)
         .await
         .map_err(|error| format!("Could not create temporary installer file: {error}"))?;
-    let mut stream = response.bytes_stream();
+    let stream = response.bytes_stream();
     let mut downloaded = 0_u64;
     let mut hasher = Sha256::new();
     emit_install_progress(
@@ -249,25 +256,24 @@ async fn download_release_asset(
         total,
         downloaded,
     )?;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("Ollama download failed: {error}"))?;
-        downloaded = downloaded
-            .checked_add(chunk.len() as u64)
-            .filter(|length| *length <= MAX_DOWNLOAD_BYTES)
-            .ok_or_else(|| "The Ollama download exceeded the size limit.".to_owned())?;
-        hasher.update(&chunk);
-        file.write_all(&chunk)
-            .await
-            .map_err(|error| format!("Could not save the Ollama download: {error}"))?;
-        emit_install_progress(
-            app,
-            request_id,
-            &asset.name,
-            "Downloading",
-            total,
-            downloaded,
-        )?;
-    }
+    downloaded = write_download_stream(
+        stream,
+        &mut file,
+        &cancellation,
+        downloaded,
+        &mut hasher,
+        |completed| {
+            emit_install_progress(
+                app,
+                request_id,
+                &asset.name,
+                "Downloading",
+                total,
+                completed,
+            )
+        },
+    )
+    .await?;
     file.flush()
         .await
         .map_err(|error| format!("Could not finish saving Ollama: {error}"))?;
@@ -285,6 +291,42 @@ async fn download_release_asset(
         Ok(true)
     } else {
         Ok(false)
+    }
+}
+
+async fn write_download_stream<S, B, E>(
+    stream: S,
+    file: &mut File,
+    cancellation: &CancellationToken,
+    mut downloaded: u64,
+    hasher: &mut Sha256,
+    mut on_progress: impl FnMut(u64) -> Result<(), String>,
+) -> Result<u64, String>
+where
+    S: Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    let mut stream = Box::pin(stream);
+    loop {
+        let chunk = tokio::select! {
+            _ = cancellation.cancelled() => return Err("Installation cancelled".to_owned()),
+            chunk = stream.next() => chunk,
+        };
+        let Some(chunk) = chunk else {
+            return Ok(downloaded);
+        };
+        let chunk = chunk.map_err(|error| format!("Ollama download failed: {error}"))?;
+        let chunk = chunk.as_ref();
+        downloaded = downloaded
+            .checked_add(chunk.len() as u64)
+            .filter(|length| *length <= MAX_DOWNLOAD_BYTES)
+            .ok_or_else(|| "The Ollama download exceeded the size limit.".to_owned())?;
+        hasher.update(chunk);
+        file.write_all(chunk)
+            .await
+            .map_err(|error| format!("Could not save the Ollama download: {error}"))?;
+        on_progress(downloaded)?;
     }
 }
 
@@ -334,7 +376,34 @@ async fn latest_release_asset(
 }
 
 #[tauri::command]
-pub async fn install_ollama(app: AppHandle, request_id: String) -> Result<String, String> {
+pub async fn install_ollama(
+    app: AppHandle,
+    backend: State<'_, BackendState>,
+    request_id: String,
+) -> Result<String, String> {
+    let installation_request_id = request_id.clone();
+    with_download_cancellation(&backend, &request_id, |cancellation| async move {
+        install_ollama_inner(app, installation_request_id, cancellation).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn ollama_cancel_install(
+    backend: State<'_, BackendState>,
+    request_id: String,
+) -> Result<(), String> {
+    backend.cancel_download(&request_id)
+}
+
+async fn install_ollama_inner(
+    app: AppHandle,
+    request_id: String,
+    cancellation: CancellationToken,
+) -> Result<String, String> {
+    if cancellation.is_cancelled() {
+        return Err("Installation cancelled".to_owned());
+    }
     let target = installer_target(env::consts::OS, env::consts::ARCH)?;
     let client = Client::builder()
         .user_agent("Legion desktop app")
@@ -342,7 +411,13 @@ pub async fn install_ollama(app: AppHandle, request_id: String) -> Result<String
         .timeout(Duration::from_secs(3 * 60 * 60))
         .build()
         .map_err(|error| format!("Could not configure secure Ollama downloads: {error}"))?;
-    let (release_tag, asset) = latest_release_asset(&client, target).await?;
+    let (release_tag, asset) = tokio::select! {
+        _ = cancellation.cancelled() => return Err("Installation cancelled".to_owned()),
+        result = latest_release_asset(&client, target) => result?,
+    };
+    if cancellation.is_cancelled() {
+        return Err("Installation cancelled".to_owned());
+    }
     let temp_path = env::temp_dir().join(format!(
         "legion-ollama-install-{}-{}",
         std::process::id(),
@@ -355,8 +430,27 @@ pub async fn install_ollama(app: AppHandle, request_id: String) -> Result<String
         .map_err(|error| format!("Could not create a temporary install directory: {error}"))?;
     let _temporary_directory = TemporaryDirectory(temp_path.clone());
     let installer_path = temp_path.join(&asset.name);
-    let checksum_verified =
-        download_release_asset(&app, &request_id, &client, target, &asset, &installer_path).await?;
+    let checksum_verified = download_release_asset(
+        &app,
+        &request_id,
+        &client,
+        target,
+        &asset,
+        &installer_path,
+        cancellation.clone(),
+    )
+    .await?;
+    if cancellation.is_cancelled() {
+        return Err("Installation cancelled".to_owned());
+    }
+    emit_install_progress(
+        &app,
+        &request_id,
+        &asset.name,
+        "Installing",
+        Some(asset.size),
+        asset.size,
+    )?;
 
     #[cfg(target_os = "windows")]
     install_windows(&app, &installer_path).await?;
@@ -575,7 +669,11 @@ async fn start_server(executable: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs as std_fs;
+    use std::{fs as std_fs, time::SystemTime};
+
+    use futures_util::stream::{self, StreamExt};
+    use sha2::{Digest, Sha256};
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn reports_installer_download_bytes_and_percentage() {
@@ -598,7 +696,8 @@ mod tests {
 
     use super::{
         emit_install_progress_with, install_progress, installer_target, replace_directory,
-        validate_release_asset, InstallerTarget, ReleaseAsset, INSTALL_PROGRESS_EVENT,
+        validate_release_asset, write_download_stream, InstallerTarget, ReleaseAsset,
+        TemporaryDirectory, INSTALL_PROGRESS_EVENT,
     };
 
     #[test]
@@ -699,6 +798,68 @@ mod tests {
         invalid.size = 150 * 1024 * 1024;
         invalid.name = "unexpected.exe".to_owned();
         assert!(validate_release_asset(InstallerTarget::WindowsX64, &invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn cancels_installer_download_mid_stream_and_removes_partial_file() {
+        let root = std::env::temp_dir().join(format!(
+            "legion-installer-cancel-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        std_fs::create_dir(&root).expect("temporary directory is created");
+        let destination = root.join("OllamaSetup.exe");
+        let cancellation = CancellationToken::new();
+        let (chunk_written, chunk_received) = tokio::sync::oneshot::channel();
+        let stream = stream::iter(vec![Ok::<_, &'static str>(b"partial".to_vec())])
+            .chain(stream::pending::<Result<Vec<u8>, &'static str>>());
+        let mut file = tokio::fs::File::create(&destination)
+            .await
+            .expect("partial installer file is created");
+        let mut hasher = Sha256::new();
+        let mut chunk_written = Some(chunk_written);
+        let progress = move |_| {
+            if let Some(sender) = chunk_written.take() {
+                let _ = sender.send(());
+            }
+            Ok(())
+        };
+        let temporary_directory = TemporaryDirectory(root.clone());
+        let download_cancellation = cancellation.clone();
+        let download = tokio::spawn(async move {
+            write_download_stream(
+                stream,
+                &mut file,
+                &download_cancellation,
+                0,
+                &mut hasher,
+                progress,
+            )
+            .await
+        });
+
+        chunk_received
+            .await
+            .expect("partial installer chunk is written");
+        assert_eq!(
+            tokio::fs::metadata(&destination)
+                .await
+                .expect("partial installer is present")
+                .len(),
+            7
+        );
+        cancellation.cancel();
+        let error = download
+            .await
+            .expect("download task completes")
+            .expect_err("cancelled installer download returns an error");
+        assert_eq!(error, "Installation cancelled");
+
+        drop(temporary_directory);
+        assert!(!root.exists(), "temporary directory removes partial file");
     }
 
     #[tokio::test]

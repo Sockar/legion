@@ -53,6 +53,10 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
 function comparableEndpoint(endpoint: string): string {
   const trimmed = endpoint.trim();
   try {
@@ -109,6 +113,9 @@ function App() {
     Record<string, TerminalOutput>
   >({});
   const controllersRef = useRef(new Map<string, AbortController>());
+  const activeDownloadControllerRef = useRef<AbortController | undefined>(
+    undefined,
+  );
   const startupInstallPromptShownRef = useRef(false);
   const installPromptInFlightRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -648,6 +655,8 @@ function App() {
     async (modelName: string) => {
       const name = modelName.trim();
       if (!name) return;
+      const controller = new AbortController();
+      activeDownloadControllerRef.current = controller;
       setIsPulling(true);
       setPullProgress(undefined);
       setRuntimeError("");
@@ -661,10 +670,15 @@ function App() {
         },
       });
       try {
-        await pullOllamaModel(name, sessionState.ollamaEndpoint, (progress) => {
-          setPullProgress(progress);
-          setDownloadFeedback({ phase: "downloading", progress });
-        });
+        await pullOllamaModel(
+          name,
+          sessionState.ollamaEndpoint,
+          (progress) => {
+            setPullProgress(progress);
+            setDownloadFeedback({ phase: "downloading", progress });
+          },
+          controller.signal,
+        );
         await refreshModels();
         setDownloadFeedback((current) =>
           current
@@ -683,12 +697,22 @@ function App() {
         );
       } catch (error) {
         const message = errorMessage(error);
-        setRuntimeError(message);
+        const cancelled = isAbortError(error);
+        if (!cancelled) setRuntimeError(message);
         setDownloadFeedback((current) =>
-          current ? { ...current, phase: "error", message } : undefined,
+          current
+            ? {
+                ...current,
+                phase: cancelled ? "cancelled" : "error",
+                message: cancelled ? "Model download cancelled." : message,
+              }
+            : undefined,
         );
         throw error;
       } finally {
+        if (activeDownloadControllerRef.current === controller) {
+          activeDownloadControllerRef.current = undefined;
+        }
         setIsPulling(false);
       }
     },
@@ -752,6 +776,8 @@ function App() {
         }
 
         setIsInstallingOllama(true);
+        const controller = new AbortController();
+        activeDownloadControllerRef.current = controller;
         setRuntimeError("");
         setOllamaInstallFeedback("Downloading and installing Ollama…");
         try {
@@ -767,8 +793,22 @@ function App() {
           let latestInstallProgress: DownloadFeedback["progress"] | undefined;
           const installMessage = await installOllama((progress) => {
             latestInstallProgress = progress;
-            setDownloadFeedback({ phase: "downloading", progress });
-          });
+            setDownloadFeedback({
+              phase:
+                progress.status === "Installing" ? "installing" : "downloading",
+              progress,
+            });
+          }, controller.signal);
+          setDownloadFeedback((current) =>
+            current
+              ? {
+                  ...current,
+                  phase: "success",
+                  progress: { ...current.progress, status: "Complete" },
+                  message: "Ollama installer downloaded and launched.",
+                }
+              : undefined,
+          );
           setOllamaInstallFeedback(
             `${installMessage} Checking the connection…`,
           );
@@ -805,13 +845,29 @@ function App() {
             );
           }
         } catch (error) {
-          const message = `Could not install or start Ollama: ${errorMessage(error)}`;
+          const cancelled = isAbortError(error);
+          const message = cancelled
+            ? "Ollama installation was cancelled."
+            : `Could not install or start Ollama: ${errorMessage(error)}`;
           setOllamaInstallFeedback(message);
-          setRuntimeError(message);
+          if (cancelled) {
+            setRuntimeError("");
+          } else {
+            setRuntimeError(message);
+          }
           setDownloadFeedback((current) =>
-            current ? { ...current, phase: "error", message } : undefined,
+            current
+              ? {
+                  ...current,
+                  phase: cancelled ? "cancelled" : "error",
+                  message,
+                }
+              : undefined,
           );
         } finally {
+          if (activeDownloadControllerRef.current === controller) {
+            activeDownloadControllerRef.current = undefined;
+          }
           setIsInstallingOllama(false);
         }
       } catch (error) {
@@ -906,7 +962,9 @@ function App() {
             type="button"
             onClick={() =>
               void handlePullModel(pullModelName).catch((error: unknown) =>
-                setRuntimeError(errorMessage(error)),
+                isAbortError(error)
+                  ? undefined
+                  : setRuntimeError(errorMessage(error)),
               )
             }
             disabled={!status?.connected || !pullModelName.trim() || isPulling}
@@ -940,6 +998,7 @@ function App() {
       {downloadFeedback && (
         <DownloadProgress
           feedback={downloadFeedback}
+          onCancel={() => activeDownloadControllerRef.current?.abort()}
           onDismiss={() => setDownloadFeedback(undefined)}
         />
       )}

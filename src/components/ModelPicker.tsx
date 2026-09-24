@@ -13,6 +13,10 @@ export const RECOMMENDED_MODELS = [
 
 const MANUAL_MODEL = "__manual_model__";
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
 function isManualModel(model: string, models: ModelInfo[]): boolean {
   return (
     !!model &&
@@ -59,7 +63,9 @@ export function ModelPicker({
       void onPullModel(selected).catch((error: unknown) => {
         onChange(model);
         setManualEntry(isManualModel(model, models));
-        setPullError(error instanceof Error ? error.message : String(error));
+        if (!isAbortError(error)) {
+          setPullError(error instanceof Error ? error.message : String(error));
+        }
       });
     }
   };
@@ -120,9 +126,11 @@ export function ModelPicker({
                 disabled={disabled}
                 onClick={() =>
                   void onPullModel(model.trim()).catch((error: unknown) => {
-                    setPullError(
-                      error instanceof Error ? error.message : String(error),
-                    );
+                    if (!isAbortError(error)) {
+                      setPullError(
+                        error instanceof Error ? error.message : String(error),
+                      );
+                    }
                   })
                 }
                 type="button"

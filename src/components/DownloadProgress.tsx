@@ -1,7 +1,7 @@
 import type { DownloadProgress as ProgressUpdate } from "../lib/ollama";
 
 export interface DownloadFeedback {
-  phase: "downloading" | "success" | "error";
+  phase: "downloading" | "installing" | "success" | "error" | "cancelled";
   progress: ProgressUpdate;
   message?: string;
 }
@@ -13,9 +13,11 @@ function formatBytes(bytes: number): string {
 
 export function DownloadProgress({
   feedback,
+  onCancel,
   onDismiss,
 }: {
   feedback: DownloadFeedback;
+  onCancel?: () => void;
   onDismiss?: () => void;
 }) {
   const { phase, progress, message } = feedback;
@@ -38,13 +40,21 @@ export function DownloadProgress({
               ? "Complete"
               : phase === "error"
                 ? "Failed"
-                : progress.status}
+                : phase === "cancelled"
+                  ? "Cancelled"
+                  : phase === "installing"
+                    ? "Installing"
+                    : progress.status}
           </span>
         </div>
-        {onDismiss && (
+        {(phase === "downloading" ? onCancel : onDismiss) && (
           <button
-            aria-label="Dismiss download status"
-            onClick={onDismiss}
+            aria-label={
+              phase === "downloading"
+                ? "Cancel download"
+                : "Dismiss download status"
+            }
+            onClick={phase === "downloading" ? onCancel : onDismiss}
             type="button"
           >
             ×
@@ -66,10 +76,15 @@ export function DownloadProgress({
           </p>
         </>
       )}
-      {(phase === "success" || phase === "error") && (
+      {phase === "installing" && <p>Running the Ollama installer…</p>}
+      {(phase === "success" || phase === "error" || phase === "cancelled") && (
         <p>
           {message ??
-            (phase === "success" ? "Download completed." : "Download failed.")}
+            (phase === "success"
+              ? "Download completed."
+              : phase === "cancelled"
+                ? "Download cancelled."
+                : "Download failed.")}
         </p>
       )}
     </section>
