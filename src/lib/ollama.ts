@@ -119,6 +119,7 @@ export async function getOllamaStatus(endpoint: string): Promise<ServerStatus> {
 
 export async function installOllama(
   onProgress: (progress: DownloadProgress) => void,
+  signal?: AbortSignal,
 ): Promise<string> {
   const requestId = crypto.randomUUID();
   const unlisten = await listen<DownloadProgress>(
@@ -127,9 +128,26 @@ export async function installOllama(
       if (payload.request_id === requestId) onProgress(payload);
     },
   );
+  let onAbort: (() => void) | undefined;
   try {
-    return await invoke<string>("install_ollama", { requestId });
+    if (signal?.aborted) {
+      throw new DOMException("Installation cancelled", "AbortError");
+    }
+    const installRequest = invoke<string>("install_ollama", { requestId });
+    if (!signal) return await installRequest;
+    const cancelled = new Promise<never>((_, reject) => {
+      onAbort = () => {
+        void invoke("ollama_cancel_install", { requestId })
+          .then(() =>
+            reject(new DOMException("Installation cancelled", "AbortError")),
+          )
+          .catch(reject);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    return await Promise.race([installRequest, cancelled]);
   } finally {
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
     unlisten();
   }
 }
@@ -142,6 +160,7 @@ export async function pullOllamaModel(
   model: string,
   endpoint: string,
   onProgress: (progress: PullProgress) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const requestId = crypto.randomUUID();
   const unlisten = await listen<PullProgress>(
@@ -151,9 +170,33 @@ export async function pullOllamaModel(
     },
   );
 
+  let onAbort: (() => void) | undefined;
   try {
-    await invoke("ollama_pull_model", { model, endpoint, requestId });
+    if (signal?.aborted) {
+      throw new DOMException("Model pull cancelled", "AbortError");
+    }
+    const pullRequest = invoke("ollama_pull_model", {
+      model,
+      endpoint,
+      requestId,
+    });
+    if (!signal) {
+      await pullRequest;
+      return;
+    }
+    const cancelled = new Promise<never>((_, reject) => {
+      onAbort = () => {
+        void invoke("ollama_cancel_pull", { requestId })
+          .then(() =>
+            reject(new DOMException("Model pull cancelled", "AbortError")),
+          )
+          .catch(reject);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    await Promise.race([pullRequest, cancelled]);
   } finally {
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
     unlisten();
   }
 }

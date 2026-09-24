@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -60,6 +61,7 @@ pub struct BackendState {
     tools: Arc<ToolRegistry>,
     pending_approvals: PendingApprovals,
     chat_cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    download_cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
 }
 
 impl Default for BackendState {
@@ -69,6 +71,7 @@ impl Default for BackendState {
             tools: Arc::new(ToolRegistry::with_examples()),
             pending_approvals: PendingApprovals::default(),
             chat_cancellations: Arc::default(),
+            download_cancellations: Arc::default(),
         }
     }
 }
@@ -84,7 +87,44 @@ impl BackendState {
             tools: Arc::new(tools),
             pending_approvals: PendingApprovals::default(),
             chat_cancellations: Arc::default(),
+            download_cancellations: Arc::default(),
         }
+    }
+
+    pub(crate) fn register_download_cancellation(
+        &self,
+        request_id: &str,
+    ) -> Result<CancellationToken, String> {
+        let mut downloads = self
+            .download_cancellations
+            .lock()
+            .map_err(|error| format!("Could not manage active downloads: {error}"))?;
+        if downloads.contains_key(request_id) {
+            return Err(format!("Download request {request_id} is already active"));
+        }
+        let cancellation = CancellationToken::new();
+        downloads.insert(request_id.to_owned(), cancellation.clone());
+        Ok(cancellation)
+    }
+
+    pub(crate) fn cancel_download(&self, request_id: &str) -> Result<(), String> {
+        if let Some(cancellation) = self
+            .download_cancellations
+            .lock()
+            .map_err(|error| format!("Could not access active downloads: {error}"))?
+            .get(request_id)
+        {
+            cancellation.cancel();
+        }
+        Ok(())
+    }
+
+    fn remove_download_cancellation(&self, request_id: &str) -> Result<(), String> {
+        self.download_cancellations
+            .lock()
+            .map_err(|error| format!("Could not clean up active downloads: {error}"))?
+            .remove(request_id);
+        Ok(())
     }
 
     pub fn register_tool(&mut self, tool: Arc<dyn Tool>) -> Result<(), String> {
@@ -102,6 +142,7 @@ pub trait LlmBackend: Send + Sync {
         &self,
         model: String,
         endpoint: &str,
+        cancellation: CancellationToken,
         on_progress: ProgressCallback,
     ) -> Result<(), String>;
     async fn chat(
@@ -193,27 +234,33 @@ impl LlmBackend for OllamaBackend {
         &self,
         model: String,
         endpoint: &str,
+        cancellation: CancellationToken,
         on_progress: ProgressCallback,
     ) -> Result<(), String> {
-        let response = self
-            .client
-            .post(self.api_url(endpoint, "/api/pull")?)
-            .json(&PullRequest {
-                name: model.clone(),
-            })
-            .send()
-            .await
-            .map_err(|error| format!("Could not reach Ollama: {error}"))?;
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => return Err("Model pull cancelled".to_owned()),
+            response = self
+                .client
+                .post(self.api_url(endpoint, "/api/pull")?)
+                .json(&PullRequest {
+                    name: model.clone(),
+                })
+                .send() => response.map_err(|error| format!("Could not reach Ollama: {error}"))?,
+        };
         let response = ensure_success(response).await?;
 
         let mut aggregator = PullProgressAggregator::default();
         let model_name = model;
-        read_ndjson(response, |line| {
+        read_ndjson_cancellable(response, cancellation.clone(), |line| {
             let item: OllamaPullProgress = parse_ndjson_line(line)?;
             on_progress(aggregator.update(&model_name, item))?;
             Ok(())
         })
-        .await
+        .await?;
+        if cancellation.is_cancelled() {
+            return Err("Model pull cancelled".to_owned());
+        }
+        Ok(())
     }
 
     async fn chat(
@@ -837,10 +884,36 @@ pub async fn ollama_pull_model(
                 .map_err(|error| error.to_string())
         })
     });
-    backend
-        .backend
-        .pull_model(model, &endpoint, on_progress)
-        .await
+    let llm_backend = backend.backend.clone();
+    with_download_cancellation(&backend, &request_id, |cancellation| async move {
+        llm_backend
+            .pull_model(model, &endpoint, cancellation, on_progress)
+            .await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn ollama_cancel_pull(
+    backend: State<'_, BackendState>,
+    request_id: String,
+) -> Result<(), String> {
+    backend.cancel_download(&request_id)
+}
+
+pub(crate) async fn with_download_cancellation<T, F, Fut>(
+    backend: &BackendState,
+    request_id: &str,
+    operation: F,
+) -> Result<T, String>
+where
+    F: FnOnce(CancellationToken) -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    let cancellation = backend.register_download_cancellation(request_id)?;
+    let result = operation(cancellation).await;
+    backend.remove_download_cancellation(request_id)?;
+    result
 }
 
 #[tauri::command]
@@ -973,24 +1046,6 @@ async fn ensure_success(response: Response) -> Result<Response, String> {
     }
 }
 
-async fn read_ndjson(
-    response: Response,
-    mut on_line: impl FnMut(&str) -> Result<(), String>,
-) -> Result<(), String> {
-    let mut stream = response.bytes_stream();
-    let mut buffer = NdjsonBuffer::default();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("Ollama stream failed: {error}"))?;
-        for line in buffer.push(&chunk) {
-            on_line(&line)?;
-        }
-    }
-    if let Some(line) = buffer.finish() {
-        on_line(&line)?;
-    }
-    Ok(())
-}
-
 async fn read_ndjson_cancellable(
     response: Response,
     cancellation: CancellationToken,
@@ -1051,11 +1106,12 @@ impl NdjsonBuffer {
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_pull_progress, normalize_endpoint, parse_ndjson_line, run_tool_loop, ApprovalHandler,
-        ChatApiRequest, ChatApiResponse, ChatCallback, ChatChunk, ChatMessage, ChatOptions,
-        ChatRequest, LlmBackend, ModelInfo, NdjsonBuffer, OllamaBackend, OllamaPullProgress,
-        PullProgress, PullProgressAggregator, ServerStatus, ToolApprovalRequest, ToolCallCallback,
-        ToolLoopCallbacks, MAX_TOOL_ITERATIONS,
+        emit_pull_progress, normalize_endpoint, parse_ndjson_line, run_tool_loop,
+        with_download_cancellation, ApprovalHandler, BackendState, ChatApiRequest, ChatApiResponse,
+        ChatCallback, ChatChunk, ChatMessage, ChatOptions, ChatRequest, LlmBackend, ModelInfo,
+        NdjsonBuffer, OllamaBackend, OllamaPullProgress, PullProgress, PullProgressAggregator,
+        ServerStatus, ToolApprovalRequest, ToolCallCallback, ToolLoopCallbacks,
+        MAX_TOOL_ITERATIONS,
     };
     use crate::tools::{
         CommandOutputCallback, RiskLevel, Tool, ToolCall, ToolContext, ToolDefinition,
@@ -1183,6 +1239,87 @@ mod tests {
         assert_eq!(models[0].size, 123);
     }
 
+    #[tokio::test]
+    async fn cancels_model_pull_mid_stream_and_cleans_up_its_registry_entry() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local HTTP listener starts");
+        let address = listener
+            .local_addr()
+            .expect("listener address is available");
+        let (chunk_sent, chunk_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("request is accepted");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.expect("request is read");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .expect("stream response headers are written");
+            let progress =
+                b"{\"status\":\"pulling\",\"digest\":\"layer\",\"total\":10,\"completed\":1}\n";
+            let chunk = format!("{:X}\r\n", progress.len());
+            stream
+                .write_all(chunk.as_bytes())
+                .await
+                .expect("chunk header is written");
+            stream
+                .write_all(progress)
+                .await
+                .expect("partial progress is written");
+            stream
+                .write_all(b"\r\n")
+                .await
+                .expect("chunk terminator is written");
+            let _ = chunk_sent.send(());
+            let mut byte = [0_u8; 1];
+            let _ = stream.read(&mut byte).await;
+        });
+
+        let backend = Arc::new(OllamaBackend::new(format!("http://{address}")));
+        let state = BackendState::with_backend(backend.clone());
+        let request_state = state.clone();
+        let endpoint = format!("http://{address}");
+        let pull = tokio::spawn(async move {
+            with_download_cancellation(&request_state, "pull-1", |cancellation| async move {
+                backend
+                    .pull_model(
+                        "llama3.1:8b".to_owned(),
+                        &endpoint,
+                        cancellation,
+                        Arc::new(|_| Ok(())),
+                    )
+                    .await
+            })
+            .await
+        });
+
+        chunk_received
+            .await
+            .expect("server sends an in-progress model layer");
+        assert!(state
+            .download_cancellations
+            .lock()
+            .expect("download registry is accessible")
+            .contains_key("pull-1"));
+        state
+            .cancel_download("pull-1")
+            .expect("model pull cancellation is requested");
+        let error = pull
+            .await
+            .expect("model pull task completes")
+            .expect_err("cancelled model pull returns an error");
+        assert_eq!(error, "Model pull cancelled");
+        assert!(!state
+            .download_cancellations
+            .lock()
+            .expect("download registry is accessible")
+            .contains_key("pull-1"));
+        server.await.expect("server observes the cancelled request");
+    }
+
     #[test]
     fn validates_ollama_endpoint_and_sampling_options() {
         assert_eq!(
@@ -1259,6 +1396,7 @@ mod tests {
             &self,
             _model: String,
             _endpoint: &str,
+            _cancellation: CancellationToken,
             _on_progress: super::ProgressCallback,
         ) -> Result<(), String> {
             Ok(())

@@ -763,6 +763,11 @@ button:disabled {
   color: #ff9ca8;
 }
 
+.download-progress--cancelled .download-progress__heading span,
+.download-progress--cancelled p {
+  color: #e0c875;
+}
+
 .settings-panel__grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

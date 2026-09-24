@@ -1,5 +1,5 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import { DownloadProgress } from "./DownloadProgress";
 
 describe("DownloadProgress", () => {
@@ -30,8 +30,10 @@ describe("DownloadProgress", () => {
   });
 
   it("renders successful and failed terminal states accessibly", () => {
+    const onDismiss = vi.fn();
     const { rerender } = render(
       <DownloadProgress
+        onDismiss={onDismiss}
         feedback={{
           phase: "success",
           progress: {
@@ -47,9 +49,17 @@ describe("DownloadProgress", () => {
     expect(screen.getByRole("status").textContent).toContain(
       "Ollama is ready.",
     );
+    expect(
+      screen.queryByRole("button", { name: "Cancel download" }),
+    ).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Dismiss download status" }),
+    );
+    expect(onDismiss).toHaveBeenCalledOnce();
 
     rerender(
       <DownloadProgress
+        onDismiss={onDismiss}
         feedback={{
           phase: "error",
           progress: {
@@ -64,5 +74,32 @@ describe("DownloadProgress", () => {
     expect(screen.getByRole("alert").textContent).toContain(
       "Network connection interrupted.",
     );
+    expect(
+      screen.queryByRole("button", { name: "Cancel download" }),
+    ).toBeNull();
+  });
+
+  it("cancels an active download instead of dismissing it", () => {
+    const onCancel = vi.fn();
+    const onDismiss = vi.fn();
+    render(
+      <DownloadProgress
+        feedback={{
+          phase: "downloading",
+          progress: {
+            request_id: "pull-1",
+            name: "llama3.1:8b",
+            status: "pulling model layers",
+          },
+        }}
+        onCancel={onCancel}
+        onDismiss={onDismiss}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel download" }));
+
+    expect(onCancel).toHaveBeenCalledOnce();
+    expect(onDismiss).not.toHaveBeenCalled();
   });
 });
