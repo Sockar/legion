@@ -10,6 +10,7 @@ import {
   type ToolAuditRecord,
 } from "../types/session";
 import type { ModelInfo, ServerStatus } from "../lib/ollama";
+import { ModelPicker } from "./ModelPicker";
 
 interface SettingsPanelProps {
   activeSession: ChatSession | null;
@@ -28,6 +29,8 @@ interface SettingsPanelProps {
   onTestConnection: (endpoint: string) => Promise<ServerStatus>;
   onAutoInstallOllamaChange: (enabled: boolean) => void;
   onInstallOllama: (endpoint: string) => Promise<void>;
+  onPullModel: (model: string) => Promise<void>;
+  isPullingModel: boolean;
   isInstallingOllama: boolean;
   installFeedback: string;
 }
@@ -43,6 +46,8 @@ export function SettingsPanel({
   onTestConnection,
   onAutoInstallOllamaChange,
   onInstallOllama,
+  onPullModel,
+  isPullingModel,
   isInstallingOllama,
   installFeedback,
 }: SettingsPanelProps) {
@@ -207,25 +212,13 @@ export function SettingsPanel({
           <div className="settings-panel__content">
             <fieldset disabled={!activeSession}>
               <legend>Session</legend>
-              <label>
-                Active model
-                <select
-                  value={model}
-                  onChange={(event) => setModel(event.target.value)}
-                >
-                  {!models.some((item) => item.name === model) && model && (
-                    <option value={model}>{model} (not installed)</option>
-                  )}
-                  {models.map((item) => (
-                    <option key={item.digest || item.name} value={item.name}>
-                      {item.name}
-                    </option>
-                  ))}
-                  {!models.length && (
-                    <option value="">No installed models</option>
-                  )}
-                </select>
-              </label>
+              <ModelPicker
+                disabled={isInstallingOllama || isPullingModel}
+                model={model}
+                models={models}
+                onChange={setModel}
+                onPullModel={onPullModel}
+              />
               <div className="settings-panel__grid">
                 <label>
                   Temperature <span>0–2</span>
@@ -433,7 +426,11 @@ export function SettingsPanel({
             <button onClick={onClose} type="button">
               Cancel
             </button>
-            <button className="settings-panel__save" type="submit">
+            <button
+              className="settings-panel__save"
+              disabled={isPullingModel || isInstallingOllama}
+              type="submit"
+            >
               Save settings
             </button>
           </footer>

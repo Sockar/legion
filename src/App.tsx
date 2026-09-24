@@ -4,6 +4,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { FileChangeReview } from "./components/FileChangeReview";
 import { ChatInput } from "./components/ChatInput";
 import { MessageList } from "./components/MessageList";
+import {
+  DownloadProgress,
+  type DownloadFeedback,
+} from "./components/DownloadProgress";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SessionSidebar } from "./components/SessionSidebar";
 import { TerminalPanel, type TerminalOutput } from "./components/TerminalPanel";
@@ -87,6 +91,7 @@ function App() {
   const [runtimeError, setRuntimeError] = useState("");
   const [ollamaInstallFeedback, setOllamaInstallFeedback] = useState("");
   const [isInstallingOllama, setIsInstallingOllama] = useState(false);
+  const [downloadFeedback, setDownloadFeedback] = useState<DownloadFeedback>();
   const [status, setStatus] = useState<ServerStatus>();
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -639,23 +644,56 @@ function App() {
     [activeSession, updateSession],
   );
 
-  const handlePullModel = async () => {
-    setIsPulling(true);
-    setPullProgress(undefined);
-    setRuntimeError("");
-    try {
-      await pullOllamaModel(
-        pullModelName.trim(),
-        sessionState.ollamaEndpoint,
-        setPullProgress,
-      );
-      await refreshModels();
-    } catch (error) {
-      setRuntimeError(errorMessage(error));
-    } finally {
-      setIsPulling(false);
-    }
-  };
+  const handlePullModel = useCallback(
+    async (modelName: string) => {
+      const name = modelName.trim();
+      if (!name) return;
+      setIsPulling(true);
+      setPullProgress(undefined);
+      setRuntimeError("");
+      setDownloadFeedback({
+        phase: "downloading",
+        progress: {
+          request_id: "",
+          name,
+          status: "Starting model download",
+          percentage: null,
+        },
+      });
+      try {
+        await pullOllamaModel(name, sessionState.ollamaEndpoint, (progress) => {
+          setPullProgress(progress);
+          setDownloadFeedback({ phase: "downloading", progress });
+        });
+        await refreshModels();
+        setDownloadFeedback((current) =>
+          current
+            ? {
+                phase: "success",
+                progress: {
+                  ...current.progress,
+                  status: "Complete",
+                  percentage: 100,
+                  completed:
+                    current.progress.total ?? current.progress.completed,
+                },
+                message: `${name} is ready to use.`,
+              }
+            : undefined,
+        );
+      } catch (error) {
+        const message = errorMessage(error);
+        setRuntimeError(message);
+        setDownloadFeedback((current) =>
+          current ? { ...current, phase: "error", message } : undefined,
+        );
+        throw error;
+      } finally {
+        setIsPulling(false);
+      }
+    },
+    [refreshModels, sessionState.ollamaEndpoint],
+  );
 
   const handleSaveSettings = useCallback(
     (
@@ -717,7 +755,20 @@ function App() {
         setRuntimeError("");
         setOllamaInstallFeedback("Downloading and installing Ollama…");
         try {
-          const installMessage = await installOllama();
+          setDownloadFeedback({
+            phase: "downloading",
+            progress: {
+              request_id: "",
+              name: "Ollama installer",
+              status: "Preparing download",
+              percentage: null,
+            },
+          });
+          let latestInstallProgress: DownloadFeedback["progress"] | undefined;
+          const installMessage = await installOllama((progress) => {
+            latestInstallProgress = progress;
+            setDownloadFeedback({ phase: "downloading", progress });
+          });
           setOllamaInstallFeedback(
             `${installMessage} Checking the connection…`,
           );
@@ -733,6 +784,19 @@ function App() {
             setOllamaInstallFeedback(
               `${installMessage} Connected to Ollama successfully.`,
             );
+            setDownloadFeedback({
+              phase: "success",
+              progress: {
+                ...(latestInstallProgress ?? {
+                  request_id: "",
+                  name: "Ollama installer",
+                  status: "Complete",
+                }),
+                status: "Complete",
+                percentage: 100,
+              },
+              message: "Ollama was installed and is ready.",
+            });
             setRuntimeError("");
             await refreshModels(endpoint);
           } else {
@@ -744,6 +808,9 @@ function App() {
           const message = `Could not install or start Ollama: ${errorMessage(error)}`;
           setOllamaInstallFeedback(message);
           setRuntimeError(message);
+          setDownloadFeedback((current) =>
+            current ? { ...current, phase: "error", message } : undefined,
+          );
         } finally {
           setIsInstallingOllama(false);
         }
@@ -837,7 +904,11 @@ function App() {
           <button
             className="pull-button"
             type="button"
-            onClick={() => void handlePullModel()}
+            onClick={() =>
+              void handlePullModel(pullModelName).catch((error: unknown) =>
+                setRuntimeError(errorMessage(error)),
+              )
+            }
             disabled={!status?.connected || !pullModelName.trim() || isPulling}
           >
             {isPulling ? (pullProgress?.status ?? "Pulling…") : "Pull"}
@@ -865,6 +936,13 @@ function App() {
           ⚙
         </button>
       </header>
+
+      {downloadFeedback && (
+        <DownloadProgress
+          feedback={downloadFeedback}
+          onDismiss={() => setDownloadFeedback(undefined)}
+        />
+      )}
 
       {storageError && (
         <p className="runtime-error" role="alert">
@@ -909,6 +987,8 @@ function App() {
           onTestConnection={handleTestConnection}
           onAutoInstallOllamaChange={handleAutoInstallOllamaChange}
           onInstallOllama={handleInstallOllama}
+          onPullModel={handlePullModel}
+          isPullingModel={isPulling}
           isInstallingOllama={isInstallingOllama}
           installFeedback={ollamaInstallFeedback}
         />
@@ -1022,8 +1102,8 @@ function App() {
                   {pullProgress && (
                     <p aria-live="polite">
                       {pullProgress.status}
-                      {pullProgress.total && pullProgress.completed != null
-                        ? ` — ${Math.round((pullProgress.completed / pullProgress.total) * 100)}%`
+                      {pullProgress.percentage != null
+                        ? ` — ${pullProgress.percentage}%`
                         : ""}
                     </p>
                   )}
