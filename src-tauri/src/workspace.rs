@@ -51,6 +51,42 @@ pub fn resolve_workspace_path(
     ensure_within_workspace(&root, resolved)
 }
 
+pub fn resolve_path_candidate(
+    workspace: &Path,
+    requested_path: &Path,
+    require_existing: bool,
+) -> Result<(PathBuf, PathBuf), String> {
+    let root = fs::canonicalize(workspace)
+        .map_err(|error| format!("Could not resolve workspace folder: {error}"))?;
+    if !root.is_dir() {
+        return Err("Workspace path is not a directory".to_owned());
+    }
+
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        root.join(requested_path)
+    };
+    let resolved = if require_existing || fs::symlink_metadata(&candidate).is_ok() {
+        fs::canonicalize(&candidate)
+            .map_err(|error| format!("Could not resolve requested path: {error}"))?
+    } else {
+        let mut existing = candidate.as_path();
+        while fs::symlink_metadata(existing).is_err() {
+            existing = existing
+                .parent()
+                .ok_or_else(|| "Path has no existing parent".to_owned())?;
+        }
+        let resolved_existing = fs::canonicalize(existing)
+            .map_err(|error| format!("Could not resolve requested path parent: {error}"))?;
+        let remaining = candidate
+            .strip_prefix(existing)
+            .map_err(|_| "Could not resolve requested path parent".to_owned())?;
+        resolved_existing.join(remaining)
+    };
+    Ok((root, resolved))
+}
+
 pub fn relative_workspace_path(
     workspace_root: &Path,
     absolute_path: &Path,
@@ -78,7 +114,7 @@ fn ensure_within_workspace(root: &Path, path: PathBuf) -> Result<PathBuf, String
 
 #[cfg(test)]
 mod tests {
-    use super::{relative_workspace_path, resolve_workspace_path};
+    use super::{relative_workspace_path, resolve_path_candidate, resolve_workspace_path};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -140,6 +176,30 @@ mod tests {
         }
         assert!(resolve_workspace_path(&root, outside, true).is_err());
         fs::remove_dir_all(root).expect("temporary directory is removed");
+    }
+
+    #[test]
+    fn resolves_outside_candidates_for_later_authorization() {
+        let parent = temporary_directory();
+        let workspace = parent.join("workspace");
+        let outside = parent.join("outside.txt");
+        fs::create_dir(&workspace).expect("workspace is created");
+        fs::write(&outside, "outside").expect("outside file is created");
+
+        assert_eq!(
+            resolve_path_candidate(&workspace, Path::new("../outside.txt"), true)
+                .expect("outside path can be identified")
+                .1,
+            fs::canonicalize(&outside).expect("outside file canonicalizes")
+        );
+        assert_eq!(
+            resolve_path_candidate(&workspace, Path::new("../new.txt"), false)
+                .expect("new outside path can be identified")
+                .1,
+            parent.join("new.txt")
+        );
+
+        fs::remove_dir_all(parent).expect("temporary directory is removed");
     }
 
     #[cfg(unix)]

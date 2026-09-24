@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::persistence::{PersistenceState, ToolAuditRecord};
 use crate::tools::{
-    CommandOutputCallback, RiskLevel, Tool, ToolCall, ToolContext, ToolDefinition, ToolRegistry,
-    ToolSchema, COMMAND_OUTPUT_EVENT,
+    ApprovalDecision, CommandOutputCallback, OutOfWorkspaceApprover, RiskLevel, Tool, ToolCall,
+    ToolContext, ToolDefinition, ToolRegistry, ToolSchema, COMMAND_OUTPUT_EVENT,
 };
 
 const DEFAULT_OLLAMA_ENDPOINT: &str = "http://localhost:11434";
@@ -620,7 +620,7 @@ pub struct ChatThinkingChunk {
 }
 
 #[derive(Clone, Default)]
-struct PendingApprovals(Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>);
+struct PendingApprovals(Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ToolApprovalRequest {
@@ -629,6 +629,10 @@ pub struct ToolApprovalRequest {
     pub tool: ToolSchema,
     pub arguments: Value,
     pub preview: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_path: Option<String>,
 }
 
 #[async_trait]
@@ -637,7 +641,7 @@ trait ApprovalHandler: Send + Sync {
         &self,
         approval: ToolApprovalRequest,
         cancellation: CancellationToken,
-    ) -> Result<bool, String>;
+    ) -> Result<ApprovalDecision, String>;
 }
 
 struct TauriApprovalHandler {
@@ -651,34 +655,157 @@ impl ApprovalHandler for TauriApprovalHandler {
         &self,
         approval: ToolApprovalRequest,
         cancellation: CancellationToken,
-    ) -> Result<bool, String> {
-        let (sender, receiver) = oneshot::channel();
-        self.pending
+    ) -> Result<ApprovalDecision, String> {
+        request_approval(&self.app, &self.pending, approval, cancellation).await
+    }
+}
+
+async fn request_approval(
+    app: &AppHandle,
+    pending: &PendingApprovals,
+    approval: ToolApprovalRequest,
+    cancellation: CancellationToken,
+) -> Result<ApprovalDecision, String> {
+    let (sender, receiver) = oneshot::channel();
+    pending
+        .0
+        .lock()
+        .map_err(|error| format!("Could not manage pending tool approvals: {error}"))?
+        .insert(approval.approval_id.clone(), sender);
+    if let Err(error) = app.emit(TOOL_APPROVAL_EVENT, &approval) {
+        pending
             .0
             .lock()
-            .map_err(|error| format!("Could not manage pending tool approvals: {error}"))?
-            .insert(approval.approval_id.clone(), sender);
-        if let Err(error) = self.app.emit(TOOL_APPROVAL_EVENT, &approval) {
-            self.pending
-                .0
-                .lock()
-                .map_err(|lock_error| format!("Could not clean up tool approval: {lock_error}"))?
-                .remove(&approval.approval_id);
-            return Err(format!("Could not request tool approval: {error}"));
+            .map_err(|lock_error| format!("Could not clean up tool approval: {lock_error}"))?
+            .remove(&approval.approval_id);
+        return Err(format!("Could not request tool approval: {error}"));
+    }
+
+    let decision = tokio::select! {
+        _ = cancellation.cancelled() => None,
+        decision = receiver => Some(
+            decision.map_err(|_| "Tool approval response was dropped".to_owned())?
+        ),
+    };
+    pending
+        .0
+        .lock()
+        .map_err(|error| format!("Could not clean up tool approval: {error}"))?
+        .remove(&approval.approval_id);
+    Ok(decision.unwrap_or(ApprovalDecision::Deny))
+}
+
+struct TauriWorkspaceAccess {
+    app: AppHandle,
+    pending: PendingApprovals,
+    persistence: PersistenceState,
+    cancellation: CancellationToken,
+    request_id: String,
+    session_id: String,
+    approval_id: String,
+    tool: ToolSchema,
+    arguments: Value,
+}
+
+struct WorkspaceAccessProvider {
+    app: AppHandle,
+    pending: PendingApprovals,
+    persistence: PersistenceState,
+}
+
+impl WorkspaceAccessProvider {
+    fn for_tool(
+        &self,
+        request_id: &str,
+        session_id: &str,
+        approval_id: &str,
+        tool: ToolSchema,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Arc<dyn OutOfWorkspaceApprover> {
+        Arc::new(TauriWorkspaceAccess {
+            app: self.app.clone(),
+            pending: self.pending.clone(),
+            persistence: self.persistence.clone(),
+            cancellation,
+            request_id: request_id.to_owned(),
+            session_id: session_id.to_owned(),
+            approval_id: approval_id.to_owned(),
+            tool,
+            arguments,
+        })
+    }
+}
+
+#[async_trait]
+impl OutOfWorkspaceApprover for TauriWorkspaceAccess {
+    async fn approve_path(&self, path: &Path) -> Result<ApprovalDecision, String> {
+        if self
+            .persistence
+            .0
+            .lock()
+            .map_err(|error| format!("Could not check trusted paths: {error}"))?
+            .is_path_trusted(path)?
+        {
+            self.audit_access(path, "trusted_path")?;
+            return Ok(ApprovalDecision::AllowAlways);
         }
 
-        let decision = tokio::select! {
-            _ = cancellation.cancelled() => None,
-            decision = receiver => Some(
-                decision.map_err(|_| "Tool approval response was dropped".to_owned())?
-            ),
-        };
-        self.pending
+        let decision = request_approval(
+            &self.app,
+            &self.pending,
+            ToolApprovalRequest {
+                request_id: self.request_id.clone(),
+                approval_id: self.approval_id.clone(),
+                tool: self.tool.clone(),
+                arguments: self.arguments.clone(),
+                preview: None,
+                approval_type: Some("out_of_workspace_access".to_owned()),
+                requested_path: Some(path.to_string_lossy().into_owned()),
+            },
+            self.cancellation.clone(),
+        )
+        .await?;
+        match decision {
+            ApprovalDecision::AllowOnce => self.audit_access(path, "allow_once")?,
+            ApprovalDecision::AllowAlways => {
+                let trusted_directory = if path.is_dir() {
+                    path
+                } else {
+                    path.parent()
+                        .ok_or_else(|| "Requested path has no parent directory".to_owned())?
+                };
+                self.persistence
+                    .0
+                    .lock()
+                    .map_err(|error| format!("Could not store trusted path: {error}"))?
+                    .grant_trusted_path(trusted_directory)?;
+                self.audit_access(path, "allow_always")?;
+            }
+            ApprovalDecision::Deny => {}
+        }
+        Ok(decision)
+    }
+}
+
+impl TauriWorkspaceAccess {
+    fn audit_access(&self, path: &Path, approval_status: &str) -> Result<(), String> {
+        self.persistence
             .0
             .lock()
-            .map_err(|error| format!("Could not clean up tool approval: {error}"))?
-            .remove(&approval.approval_id);
-        Ok(decision.unwrap_or(false))
+            .map_err(|error| format!("Could not access SQLite audit log: {error}"))?
+            .append_tool_audit_log(&ToolAuditRecord {
+                id: format!("{}-path-access", self.approval_id),
+                session_id: self.session_id.clone(),
+                tool_name: self.tool.name.clone(),
+                arguments_summary: serde_json::to_string(&json!({
+                    "requested_path": path
+                }))
+                .map_err(|error| format!("Could not summarize approved path: {error}"))?,
+                approval_status: approval_status.to_owned(),
+                execution_status: "authorized".to_owned(),
+                created_at: unix_timestamp(),
+            })
     }
 }
 
@@ -741,12 +868,24 @@ async fn run_tool_loop(
             let mut approval_status = "approved";
             let result = if let Some(tool) = tools.get(&call.function.name) {
                 let schema = tool.schema();
-                let context = ToolContext {
-                    workspace: workspace.clone(),
-                    request_id: request_id.to_owned(),
-                    command_id: format!("{request_id}-{iteration}-{call_index}"),
-                    command_output: Some(callbacks.command_output.clone()),
-                };
+                let call_id = format!("{request_id}-{iteration}-{call_index}");
+                let path_approver = callbacks.workspace_access.map(|provider| {
+                    provider.for_tool(
+                        request_id,
+                        &request.session_id,
+                        &format!("{call_id}-path"),
+                        schema.clone(),
+                        call_arguments.clone(),
+                        cancellation.clone(),
+                    )
+                });
+                let context = ToolContext::new(
+                    workspace.clone(),
+                    request_id.to_owned(),
+                    call_id.clone(),
+                    Some(callbacks.command_output.clone()),
+                    path_approver,
+                );
                 let blocked_reason = if call.function.name == "run_command" {
                     call_arguments
                         .get("command")
@@ -789,19 +928,21 @@ async fn run_tool_loop(
                                     tool: schema.clone(),
                                     arguments: call_arguments.clone(),
                                     preview: preview.clone(),
+                                    approval_type: None,
+                                    requested_path: None,
                                 },
                                 cancellation.clone(),
                             )
                             .await;
-                        let approved = match approved {
-                            Ok(approved) => approved,
+                        let decision = match approved {
+                            Ok(decision) => decision,
                             Err(error) => {
                                 approval_status = "rejected";
                                 rejection_result = Some(json!({ "error": error }));
-                                false
+                                ApprovalDecision::Deny
                             }
                         };
-                        if !approved && rejection_result.is_none() {
+                        if decision == ApprovalDecision::Deny && rejection_result.is_none() {
                             approval_status = "rejected";
                             rejection_result = Some(
                                 json!({ "error": "User denied permission to run this tool." }),
@@ -866,6 +1007,7 @@ async fn run_tool_loop(
 
 struct ToolLoopCallbacks<'a> {
     approval_handler: &'a dyn ApprovalHandler,
+    workspace_access: Option<&'a WorkspaceAccessProvider>,
     command_output: CommandOutputCallback,
     on_chunk: ChatCallback,
     on_thinking: ThinkingCallback,
@@ -1021,6 +1163,11 @@ pub async fn ollama_chat(
         app: app.clone(),
         pending: backend.pending_approvals.clone(),
     };
+    let workspace_access = WorkspaceAccessProvider {
+        app: app.clone(),
+        pending: backend.pending_approvals.clone(),
+        persistence: PersistenceState(persistence.0.clone()),
+    };
     let output_app = app.clone();
     let command_output: CommandOutputCallback = Arc::new(move |event| {
         output_app
@@ -1053,9 +1200,10 @@ pub async fn ollama_chat(
         &backend.tools,
         request,
         &request_id,
-        cancellation,
+        cancellation.clone(),
         ToolLoopCallbacks {
             approval_handler: &approval_handler,
+            workspace_access: Some(&workspace_access),
             command_output,
             on_chunk,
             on_thinking,
@@ -1075,7 +1223,7 @@ pub async fn ollama_chat(
 pub async fn respond_tool_approval(
     backend: State<'_, BackendState>,
     approval_id: String,
-    approved: bool,
+    decision: ApprovalDecision,
 ) -> Result<(), String> {
     let sender = backend
         .pending_approvals
@@ -1085,7 +1233,7 @@ pub async fn respond_tool_approval(
         .remove(&approval_id)
         .ok_or_else(|| format!("No pending approval found for {approval_id}"))?;
     sender
-        .send(approved)
+        .send(decision)
         .map_err(|_| format!("Tool approval request {approval_id} is no longer active"))
 }
 
@@ -1183,8 +1331,8 @@ mod tests {
         ToolCallCallback, ToolLoopCallbacks, MAX_TOOL_ITERATIONS,
     };
     use crate::tools::{
-        CommandOutputCallback, RiskLevel, Tool, ToolCall, ToolContext, ToolDefinition,
-        ToolFunctionCall, ToolRegistry, ToolSchema,
+        ApprovalDecision, CommandOutputCallback, RiskLevel, Tool, ToolCall, ToolContext,
+        ToolDefinition, ToolFunctionCall, ToolRegistry, ToolSchema,
     };
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -1732,9 +1880,13 @@ mod tests {
             &self,
             _approval: ToolApprovalRequest,
             _cancellation: CancellationToken,
-        ) -> Result<bool, String> {
+        ) -> Result<ApprovalDecision, String> {
             self.1.fetch_add(1, Ordering::SeqCst);
-            Ok(self.0)
+            Ok(if self.0 {
+                ApprovalDecision::AllowOnce
+            } else {
+                ApprovalDecision::Deny
+            })
         }
     }
 
@@ -1859,6 +2011,7 @@ mod tests {
             CancellationToken::new(),
             ToolLoopCallbacks {
                 approval_handler: &approval,
+                workspace_access: None,
                 command_output: command_output_callback(),
                 on_chunk: on_chunk.clone(),
                 on_thinking: Arc::new(|_| Ok(())),
@@ -1918,6 +2071,7 @@ mod tests {
             CancellationToken::new(),
             ToolLoopCallbacks {
                 approval_handler: &approval,
+                workspace_access: None,
                 command_output: command_output_callback(),
                 on_chunk: on_chunk.clone(),
                 on_thinking: Arc::new(|_| Ok(())),
@@ -1973,6 +2127,7 @@ mod tests {
             CancellationToken::new(),
             ToolLoopCallbacks {
                 approval_handler: &approval,
+                workspace_access: None,
                 command_output: command_output_callback(),
                 on_chunk: on_chunk.clone(),
                 on_thinking: Arc::new(|_| Ok(())),
@@ -2023,6 +2178,7 @@ mod tests {
             CancellationToken::new(),
             ToolLoopCallbacks {
                 approval_handler: &approval,
+                workspace_access: None,
                 command_output: command_output_callback(),
                 on_chunk: on_chunk.clone(),
                 on_thinking: Arc::new(|_| Ok(())),
@@ -2059,6 +2215,7 @@ mod tests {
             CancellationToken::new(),
             ToolLoopCallbacks {
                 approval_handler: &approval,
+                workspace_access: None,
                 command_output: command_output_callback(),
                 on_chunk: on_chunk.clone(),
                 on_thinking: Arc::new(|_| Ok(())),

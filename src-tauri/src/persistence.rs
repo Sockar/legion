@@ -1,5 +1,6 @@
 use std::{
-    path::Path,
+    fs,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -74,6 +75,13 @@ const MIGRATIONS: &[(i64, &str)] = &[
         ADD COLUMN enable_reasoning INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE messages
         ADD COLUMN reasoning TEXT;",
+    ),
+    (
+        4,
+        "CREATE TABLE trusted_paths (
+        path TEXT PRIMARY KEY NOT NULL,
+        created_at TEXT NOT NULL
+    );",
     ),
 ];
 
@@ -195,6 +203,7 @@ pub struct Database {
     connection: Connection,
 }
 
+#[derive(Clone)]
 pub struct PersistenceState(pub Arc<Mutex<Database>>);
 
 impl Database {
@@ -244,6 +253,73 @@ impl Database {
                     record.execution_status,
                     record.created_at,
                 ],
+            )
+            .map_err(storage_error)?;
+        Ok(())
+    }
+
+    pub fn grant_trusted_path(&mut self, path: &Path) -> Result<PathBuf, String> {
+        let canonical_path = fs::canonicalize(path)
+            .map_err(|error| format!("Could not canonicalize trusted path: {error}"))?;
+        if !canonical_path.is_dir() {
+            return Err("Trusted path must be an existing directory".to_owned());
+        }
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO trusted_paths (path, created_at) VALUES (?1, ?2)",
+                params![canonical_path.to_string_lossy(), current_timestamp()],
+            )
+            .map_err(storage_error)?;
+        Ok(canonical_path)
+    }
+
+    pub fn is_path_trusted(&self, path: &Path) -> Result<bool, String> {
+        let mut existing = path;
+        while fs::symlink_metadata(existing).is_err() {
+            existing = existing
+                .parent()
+                .ok_or_else(|| "Trusted-path check has no existing parent".to_owned())?;
+        }
+        let canonical_existing = fs::canonicalize(existing)
+            .map_err(|error| format!("Could not canonicalize requested path: {error}"))?;
+        let remaining = path
+            .strip_prefix(existing)
+            .map_err(|_| "Could not resolve requested path".to_owned())?;
+        let canonical_path = canonical_existing.join(remaining);
+        let mut statement = self
+            .connection
+            .prepare("SELECT path FROM trusted_paths")
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage_error)?;
+        for row in rows {
+            let trusted_path = PathBuf::from(row.map_err(storage_error)?);
+            if canonical_path.starts_with(trusted_path) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn list_trusted_paths(&self) -> Result<Vec<PathBuf>, String> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT path FROM trusted_paths ORDER BY path")
+            .map_err(storage_error)?;
+        let paths = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage_error)?
+            .map(|row| row.map(PathBuf::from).map_err(storage_error))
+            .collect();
+        paths
+    }
+
+    pub fn revoke_trusted_path(&mut self, path: &Path) -> Result<(), String> {
+        self.connection
+            .execute(
+                "DELETE FROM trusted_paths WHERE path = ?1",
+                [path.to_string_lossy().as_ref()],
             )
             .map_err(storage_error)?;
         Ok(())
@@ -636,6 +712,13 @@ fn nonempty_timestamp(timestamp: &str) -> String {
     }
 }
 
+fn current_timestamp() -> String {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
+        |_| "0".to_owned(),
+        |duration| duration.as_millis().to_string(),
+    )
+}
+
 fn storage_error(error: impl std::fmt::Display) -> String {
     format!("SQLite persistence error: {error}")
 }
@@ -698,9 +781,13 @@ pub fn initialize(app: &AppHandle) -> Result<PersistenceState, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{migrate, ChatMessage, ChatSession, ChatSettings, Database, PersistedSessionState};
+    use super::{
+        current_timestamp, migrate, ChatMessage, ChatSession, ChatSettings, Database,
+        PersistedSessionState,
+    };
     use rusqlite::Connection;
     use serde_json::json;
+    use std::fs;
 
     fn sample_state() -> PersistedSessionState {
         PersistedSessionState {
@@ -766,13 +853,14 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
                  AND name IN ('sessions', 'messages', 'session_settings',
-                              'app_settings', 'tool_call_history', 'tool_audit_log')",
+                              'app_settings', 'tool_call_history', 'tool_audit_log',
+                              'trusted_paths')",
                 [],
                 |row| row.get(0),
             )
             .expect("schema tables can be counted");
-        assert_eq!(version, 3);
-        assert_eq!(table_count, 6);
+        assert_eq!(version, 4);
+        assert_eq!(table_count, 7);
     }
 
     #[test]
@@ -890,5 +978,42 @@ mod tests {
             database.load(None).expect("audit log loads").tool_audit_log,
             vec![record]
         );
+    }
+
+    #[test]
+    fn trusted_paths_are_canonical_persistent_and_revocable() {
+        let directory =
+            std::env::temp_dir().join(format!("legion-trusted-path-{}", current_timestamp()));
+        fs::create_dir_all(directory.join("nested")).expect("trusted directory is created");
+        let mut database = Database {
+            connection: Connection::open_in_memory().expect("in-memory db opens"),
+        };
+        migrate(&mut database.connection).expect("schema migrates");
+
+        let granted = database
+            .grant_trusted_path(&directory)
+            .expect("trusted directory is stored");
+        assert_eq!(
+            granted,
+            fs::canonicalize(&directory).expect("directory canonicalizes")
+        );
+        assert!(database
+            .is_path_trusted(&directory.join("nested").join("new.txt"))
+            .expect("nested file is checked"));
+        assert!(!database
+            .is_path_trusted(&std::env::temp_dir().join("untrusted.txt"))
+            .expect("untrusted file is checked"));
+        assert_eq!(
+            database.list_trusted_paths().expect("trusted paths list"),
+            vec![granted.clone()]
+        );
+
+        database
+            .revoke_trusted_path(&granted)
+            .expect("trusted directory is revoked");
+        assert!(!database
+            .is_path_trusted(&directory.join("nested"))
+            .expect("revoked directory is no longer trusted"));
+        fs::remove_dir_all(directory).expect("temporary directory is removed");
     }
 }
