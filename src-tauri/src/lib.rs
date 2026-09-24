@@ -8,6 +8,11 @@ pub mod workspace;
 
 use tauri::Manager;
 
+#[tauri::command]
+fn get_target_os() -> &'static str {
+    std::env::consts::OS
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -25,6 +30,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             persistence::load_session_state,
             persistence::save_session_state,
+            get_target_os,
             ollama::ollama_status,
             ollama_installer::install_ollama,
             ollama_installer::ollama_cancel_install,
@@ -37,4 +43,24 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_target_os;
+
+    #[test]
+    fn target_os_matches_the_compilation_target() {
+        let expected = if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(target_os = "linux") {
+            "linux"
+        } else {
+            std::env::consts::OS
+        };
+
+        assert_eq!(get_target_os(), expected);
+    }
 }

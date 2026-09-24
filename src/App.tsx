@@ -17,6 +17,7 @@ import {
 import { buildChatMessages } from "./lib/chatMessages";
 import {
   getOllamaStatus,
+  getTargetOS,
   installOllama,
   listOllamaModels,
   pullOllamaModel,
@@ -311,7 +312,11 @@ function App() {
         await streamOllamaChat(
           sessionId,
           model,
-          buildChatMessages(history, settings.systemPrompt),
+          buildChatMessages(
+            history,
+            settings.systemPrompt,
+            await getTargetOS(),
+          ),
           workspacePath,
           endpoint,
           settings,

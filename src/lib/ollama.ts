@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import type { TargetOS } from "../types/platform";
 import type { ChatSettings } from "../types/session";
 
 export interface ModelInfo {
@@ -124,6 +125,10 @@ export interface ChatThinkingChunk {
 
 export async function getOllamaStatus(endpoint: string): Promise<ServerStatus> {
   return invoke<ServerStatus>("ollama_status", { endpoint });
+}
+
+export async function getTargetOS(): Promise<TargetOS> {
+  return invoke<TargetOS>("get_target_os");
 }
 
 export async function installOllama(
