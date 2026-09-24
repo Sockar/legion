@@ -30,6 +30,11 @@ The initial read-only examples are `get_current_time` and
 `list_workspace_files`; `read_file`, `create_file`, and `edit_file` tools are
 also available. File tools accept workspace-relative or absolute paths and
 resolve them against the active session's workspace.
+Every chat also includes a default system instruction telling the model to
+attempt requested file operations outside the workspace using absolute paths;
+Legion will ask the user to allow or deny access, and a denial is returned to
+the model as a tool error. An optional user-configured system prompt follows
+this default instruction.
 Creates fail for existing files unless `overwrite` is explicitly true. Edits
 use an exact `old_str` to
 `new_str` replacement and reject missing or ambiguous matches. File mutations
